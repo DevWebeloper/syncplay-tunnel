@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Name=Syncplay Tunnel
+GenericName=Verified proxy launcher for Syncplay
+Comment=Route Syncplay and mpv through a remote machine, and check it before playing
+Exec=syncplay-tunnel
+Icon=syncplay-tunnel
+Terminal=false
+Categories=AudioVideo;Video;Player;Network;
+Keywords=syncplay;mpv;proxy;ssh;tailscale;
+StartupNotify=true
+# Matches APP_ID, so the compositor pairs the window with this entry even though
+# the file is not named after the application ID.
+StartupWMClass=io.github.DevWebeloper.SyncplayTunnel
+Actions=QuickLaunch;
+
+[Desktop Action QuickLaunch]
+Name=Check route and start watching
+Exec=syncplay-tunnel --launch
