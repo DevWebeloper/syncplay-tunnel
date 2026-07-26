@@ -185,13 +185,14 @@ If you only ever see *This system*, check the Activity log — it names which of
 these applies. `distrobox-host-exec` ships with distrobox's container setup; if
 it's absent, run the app on the Silverblue host instead.
 
-Environments are a dropdown over a plain string list — no custom item factory,
-which is the part that rendered as nothing on Silverblue. Results are sorted so
-environments with both Syncplay and mpv come first, with this system winning
-ties. Your choice is saved and re-selected on the next run, as long as it still
-exists.
+Environments are a scrolling list, built the same way as the host picker: plain
+rows in a `Gtk.ListBox`, no custom item factory, no popover. Every environment is
+visible at once with its status, and the list scrolls once there are more than a
+few. Results are sorted so environments with both Syncplay and mpv come first,
+with this system winning ties. Your choice is saved and re-selected on the next
+run, as long as it still exists.
 
-Under the dropdown is the status of whatever is selected. If something is
+Under the list is the status of whatever is selected. If something is
 missing, an **Install** button appears and puts it in *that* environment:
 
 | Where | How |
@@ -321,7 +322,7 @@ On the **host machine**: sshd running, Tailscale up. Nothing else.
    (Client) or check the reported details (Host).
 2. **What to play** — optional. A URL here starts for both of you and skips
    Syncplay's setup dialog.
-3. **Where to play** — pick the system or container from the dropdown. *Rescan*
+3. **Where to play** — pick the system or container from the list. *Rescan*
    re-checks, and *Install* fills in whatever is missing there.
 4. **Check the route** — watch the seven rows. Client mode only; the host
    has nothing to route through.

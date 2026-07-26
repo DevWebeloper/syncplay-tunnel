@@ -282,9 +282,7 @@ The selector was also changed from `Gtk.DropDown` to a `Gtk.ListBox`: every
 environment is visible with its status, and there is no popover to behave
 differently across GTK builds.
 
-**Superseded — see §16.** On Silverblue the `ListBox` in a `ScrolledWindow` drew
-nothing at all, so the selector is a `Gtk.DropDown` again, this time over a plain
-`Gtk.StringList`.
+**See §16.1 for the round trip this widget took** — dropdown, then list again.
 
 ---
 
@@ -468,7 +466,7 @@ Ordered by how likely they are to bite.
 
 1. Install on the Silverblue **host** (not the container) and confirm the
    Activity log's first line says *on the host system*.
-2. Confirm the environment dropdown shows both *This system* and *distrobox:
+2. Confirm the environment list shows both *This system* and *distrobox:
    sync-ubuntu* with correct status.
 3. Run the route check without a key installed and confirm the password dialog
    opens by itself.
@@ -487,19 +485,25 @@ Reported: on Silverblue the environment selector rendered as nothing (clicking
 did nothing, while *Rescan* logged the containers correctly); on CachyOS it was
 fine. Plus five requests, below.
 
-### 16.1 Selector back to a dropdown
+### 16.1 Selector: dropdown, then a scrolling list again
 
-The scan was never the problem this time — the widget was. `Gtk.ListBox` inside a
-`Gtk.ScrolledWindow` inside a `Gtk.Frame` drew at zero height there. It is now a
-`Gtk.DropDown` over a `Gtk.StringList`, with **no** `Gtk.SignalListItemFactory`
-and no expression: the built-in label factory is the part that behaves the same
-across GTK builds.
+First attempt at the Silverblue report was a `Gtk.DropDown` over a
+`Gtk.StringList` — no `Gtk.SignalListItemFactory`, no expression, on the theory
+that the old `ListBox`-in-a-`ScrolledWindow` drew at zero height. That theory was
+never confirmed on Silverblue hardware.
 
-`selected_runtime()` is now an index into `self.runtimes`, guarding
-`Gtk.INVALID_LIST_POSITION` and a stale index after a model swap. Note that
-`Gtk.DropDown` autoselects — it will not accept the invalid sentinel while the
-model has items — so that guard only fires on the race, which is why the test
-drives it through a stub.
+**Current state, by request:** the selector matches *Pick a host to route
+through* — a `Gtk.ListBox` (`SelectionMode.SINGLE`, `boxed-list`) inside a
+`Gtk.ScrolledWindow` with `NEVER`/`AUTOMATIC` policy, `min_content_height=120`
+and `max_content_height=220`, so it grows to a few rows then scrolls. Rows are
+plain `Gtk.Label`s; incomplete environments get the `dim` class.
+
+`_set_env_rows(found, placeholder, select)` is the single place rows are built —
+it clears, refills, and selects by index. Each row carries `row.runtime`, so
+`selected_runtime()` is just `getattr(row, "runtime", None)`; there is no index
+arithmetic and no `Gtk.INVALID_LIST_POSITION` guard left (the constant was
+deleted). An empty result leaves one non-selectable placeholder row, which is
+why `selected_runtime()` still returns `None` and the launch guard still fires.
 
 Underneath sits a detail label with the selected environment's status, plus the
 install button (§16.3).
@@ -580,9 +584,14 @@ Same style as §14 — offline, no hardware:
   exporting no proxy.
 - `install_plan()` for all three routes.
 - The **real** window built on the real display and driven without being shown:
-  dropdown model matches the scan, every index maps to its runtime, role toggles
-  both ways, `collect()` round-trips `play_url` and both switches, and the launch
-  guard fires with nothing selected.
+  role toggles both ways, `collect()` round-trips `play_url` and both switches,
+  and the launch guard fires with nothing selected.
+- The environment list, same way (`test_envlist.py`, 24 checks): scroller policy
+  and height cap, placeholder before the scan, one row per runtime with matching
+  labels, selecting each row in turn resolves to its runtime, dim class on
+  incomplete rows, the detail text and install button for ready / half / neither
+  / not-scanned, and an empty rescan going back to a placeholder with no
+  selection.
 
 Still unrun on hardware: the Silverblue render itself, and the install button on
 a machine that is actually missing something.

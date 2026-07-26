@@ -42,9 +42,6 @@ from urllib.parse import urlsplit
 APP_ID = "io.github.DevWebeloper.SyncplayTunnel"
 APP_NAME = "Syncplay Tunnel"
 
-# Gtk.DropDown reports "nothing selected" with this sentinel.
-INVALID_SELECTION = getattr(Gtk, "INVALID_LIST_POSITION", 0xFFFFFFFF)
-
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "syncplay-tunnel"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "syncplay-tunnel"
@@ -1931,14 +1928,23 @@ class Window(Gtk.ApplicationWindow):
 
         self.runtimes = []
 
-        # A dropdown over a plain Gtk.StringList. No SignalListItemFactory and
-        # no expression: the default label factory is the part that renders the
-        # same on every GTK build, which the nested list-in-a-scroller did not.
-        self.env_drop = Gtk.DropDown()
-        self.env_drop.set_model(Gtk.StringList.new(["scanning…"]))
-        self.env_drop.set_hexpand(True)
-        self.env_drop.connect("notify::selected", self.on_env_selected)
-        grid.attach(self.env_drop, 0, 0, 3, 1)
+        # Same widget as the host picker: a plain ListBox of rows inside a
+        # scroller, each row carrying its runtime. Nothing here depends on a
+        # list factory or an expression, so it draws the same on every build.
+        self.env_list = Gtk.ListBox()
+        self.env_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.env_list.add_css_class("boxed-list")
+        self.env_list.set_hexpand(True)
+        self.env_list.connect("row-selected", self.on_env_selected)
+
+        env_holder = Gtk.ScrolledWindow()
+        env_holder.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        env_holder.set_min_content_height(120)
+        env_holder.set_max_content_height(220)
+        env_holder.set_hexpand(True)
+        env_holder.set_child(self.env_list)
+        grid.attach(env_holder, 0, 0, 3, 1)
+        self._set_env_rows([])
 
         self.env_detail = Gtk.Label(label="", xalign=0)
         self.env_detail.set_wrap(True)
@@ -1968,6 +1974,42 @@ class Window(Gtk.ApplicationWindow):
         self.where_note.add_css_class("dim")
         grid.attach(self.where_note, 0, 3, 3, 1)
         return frame
+
+    def _set_env_rows(self, found, placeholder="Scanning…", select=None):
+        """Refill the environment list. `select` is an index into `found`."""
+        child = self.env_list.get_first_child()
+        while child:
+            nxt = child.get_next_sibling()
+            self.env_list.remove(child)
+            child = nxt
+
+        if not found:
+            row = Gtk.ListBoxRow()
+            lbl = Gtk.Label(label=placeholder, xalign=0)
+            lbl.set_margin_top(8); lbl.set_margin_bottom(8)
+            lbl.set_margin_start(10); lbl.set_margin_end(10)
+            lbl.add_css_class("dim")
+            row.set_child(lbl)
+            row.set_selectable(False)
+            self.env_list.append(row)
+            return
+
+        chosen = None
+        for i, rt in enumerate(found):
+            row = Gtk.ListBoxRow()
+            lbl = Gtk.Label(label=rt.label(), xalign=0)
+            lbl.set_wrap(True)
+            lbl.set_max_width_chars(52)
+            lbl.set_margin_top(8); lbl.set_margin_bottom(8)
+            lbl.set_margin_start(10); lbl.set_margin_end(10)
+            if not rt.complete:
+                lbl.add_css_class("dim")
+            row.set_child(lbl)
+            row.runtime = rt
+            self.env_list.append(row)
+            if i == select:
+                chosen = row
+        self.env_list.select_row(chosen or self.env_list.get_row_at_index(0))
 
     def _build_what(self):
         frame, grid = self._frame("What to play")
@@ -2000,9 +2042,6 @@ class Window(Gtk.ApplicationWindow):
         def apply():
             self.runtimes = found
 
-            labels = [rt.label() for rt in found] or ["Nothing found to launch from"]
-            self.env_drop.set_model(Gtk.StringList.new(labels))
-
             # keep the saved choice if it still exists, else take the best one
             want = self.cfg["runtime_kind"]
             if want == "distrobox" and self.cfg["container"]:
@@ -2015,9 +2054,8 @@ class Window(Gtk.ApplicationWindow):
                     break
                 if index is None and rt.complete:
                     index = i
-            # A fresh model starts unselected on some builds, so say it outright.
-            self.env_drop.set_selected(index or 0)
-            self.env_drop.set_sensitive(bool(found))
+
+            self._set_env_rows(found, "Nothing found to launch from", index or 0)
             self.on_env_selected()
 
             complete = [r for r in found if r.complete]
@@ -2038,10 +2076,8 @@ class Window(Gtk.ApplicationWindow):
             self.log("Found %s" % r.label())
 
     def selected_runtime(self):
-        index = self.env_drop.get_selected()
-        if index is None or index == INVALID_SELECTION or index >= len(self.runtimes):
-            return None
-        return self.runtimes[index]
+        row = self.env_list.get_selected_row()
+        return getattr(row, "runtime", None) if row is not None else None
 
     def missing_in(self, rt):
         missing = []
