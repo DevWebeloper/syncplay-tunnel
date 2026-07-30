@@ -20,5 +20,6 @@ __pycache__/
 *.bak
 *.orig
 
-# local agent settings
-.claude/settings.local.json
+# local agent state -- machine-specific, nothing here belongs to the project
+.claude/
+.claude-flow/
