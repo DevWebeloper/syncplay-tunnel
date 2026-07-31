@@ -30,6 +30,7 @@ import shutil
 import signal
 import socket
 import socketserver
+import ssl
 import struct
 import subprocess
 import sys
@@ -37,7 +38,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 APP_ID = "io.github.DevWebeloper.SyncplayTunnel"
 APP_NAME = "Syncplay Tunnel"
@@ -54,6 +55,18 @@ IP_ECHOS = [
     "https://ifconfig.me/ip",
     "https://icanhazip.com",
 ]
+
+# Stremio's own addons, spoken directly. Cinemeta is the metadata catalogue the
+# Stremio app itself uses and needs no key; Torrentio is the source finder, and
+# it takes the debrid key inside its URL path — which is why nothing from these
+# URLs is ever logged raw.
+CINEMETA = "https://v3-cinemeta.strem.io"
+TORRENTIO = "https://torrentio.strem.fun"
+
+# syncplay/utils.py playlistIsValid() rejects anything past these, silently, on
+# the server. Better to say so here than to have the push vanish.
+PLAYLIST_MAX_ITEMS = 250
+PLAYLIST_MAX_CHARACTERS = 10000
 
 DEFAULTS = {
     "host_ip": "",
@@ -79,6 +92,17 @@ DEFAULTS = {
     "mpv_extra": "",
     "require_verified": True,
     "stop_container_on_drop": True,
+    # Library browser. The key is the same one already handed to Torrentio by
+    # the Stremio addon, and it lands in config.json, which is written 0600.
+    "rd_api_key": "",
+    "torrentio_opts": "sort=qualitysize",
+    "preferred_quality": "1080p",
+    # Where the last session got to, so reopening the browser lands on the next
+    # episode instead of the search box. Set programmatically, no widget.
+    "library_series_id": "",
+    "library_series_name": "",
+    "library_season": 0,
+    "library_episode": 0,
 }
 
 
@@ -121,6 +145,84 @@ def run(cmd, timeout=15, env=None):
         return 127, "", "%s not found" % cmd[0]
     except Exception as exc:  # pragma: no cover
         return 1, "", str(exc)
+
+
+def redact(text, *secrets):
+    """Blank out anything that must never reach the log or the UI.
+
+    The debrid key travels inside the Torrentio URL path, so any message that
+    might carry one of those URLs goes through here first.
+    """
+    out = str(text)
+    for secret in secrets:
+        secret = (secret or "").strip()
+        # A short or empty value would match everywhere and redact the message
+        # itself, which hides real errors.
+        if len(secret) >= 8:
+            out = out.replace(secret, "***")
+    return out
+
+
+def _scrubbed_env():
+    """os.environ without proxy variables, so a route is never picked up by
+    accident. Ambient proxy settings would silently change which IP a request
+    leaves from, which is the one thing this app exists to control."""
+    env = dict(os.environ)
+    for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
+              "ALL_PROXY", "all_proxy"):
+        env.pop(k, None)
+    return env
+
+
+def curl_json(url, socks_port=None, timeout=20):
+    """Fetch JSON with curl. Returns (data, error) — data is None on failure.
+
+    Every other fetch in this app shells out to curl, which keeps the zero-pip
+    promise and, more usefully, makes the route an explicit argument: pass a
+    port to go through the tunnel, pass nothing to go direct.
+    """
+    cmd = ["curl", "-s", "-L", "--max-time", str(timeout),
+           "-H", "Accept: application/json"]
+    if socks_port:
+        cmd += ["--socks5-hostname", "127.0.0.1:%d" % socks_port]
+    else:
+        cmd += ["--noproxy", "*"]
+    rc, out, err = run(cmd + [url], timeout=timeout + 5, env=_scrubbed_env())
+    if rc != 0:
+        return None, err or "curl exited %s" % rc
+    if not out.strip():
+        return None, "empty reply"
+    try:
+        return json.loads(out), ""
+    except ValueError as exc:
+        return None, "not JSON (%s)" % exc
+
+
+def curl_final_url(url, socks_port=None, timeout=180):
+    """Follow redirects and report where they land. Returns (url, error).
+
+    Asks for one byte rather than issuing a HEAD: some CDNs answer HEAD with
+    405, and every one of them handles a range request because seeking needs
+    it. Without the range this would download the whole episode.
+
+    The timeout is deliberately generous. Torrentio's resolver has to reach the
+    debrid service and have it hand back a link, and measured against real
+    sources that takes anywhere from a couple of seconds to about ninety, even
+    for a torrent the service already has cached.
+    """
+    cmd = ["curl", "-s", "-L", "-o", "/dev/null", "-r", "0-0",
+           "--max-time", str(timeout), "-w", "%{url_effective}\t%{http_code}"]
+    if socks_port:
+        cmd += ["--socks5-hostname", "127.0.0.1:%d" % socks_port]
+    else:
+        cmd += ["--noproxy", "*"]
+    rc, out, err = run(cmd + [url], timeout=timeout + 5, env=_scrubbed_env())
+    if rc != 0:
+        return None, err or "curl exited %s" % rc
+    final, _, code = out.strip().partition("\t")
+    if not code.startswith("2"):
+        return None, "HTTP %s" % (code or "?")
+    return final or None, "" if final else "no redirect target"
 
 
 def notify(title, body, urgent=False):
@@ -874,13 +976,20 @@ def syncplay_ini_path():
     return xdg / "syncplay.ini"
 
 
-def prepare_syncplay_ini(url, trust_domain, log=None, path=None):
-    """Turn off Syncplay's setup dialog, and optionally trust the URL's domain.
+def prepare_syncplay_ini(urls, trust_domain, log=None, path=None):
+    """Turn off Syncplay's setup dialog, and optionally trust the URLs' domains.
+
+    Takes one URL or several: a queued season can span more than one debrid
+    hostname, and an untrusted one costs a confirmation prompt mid-episode.
 
     Values are read and written raw: Syncplay escapes % as %% and configparser's
     default interpolation would blow up on it. The file is utf-8 with a BOM,
     which is what Syncplay itself writes.
     """
+    if isinstance(urls, str):
+        urls = [urls]
+    urls = [u for u in (urls or []) if u]
+
     def say(msg):
         if log:
             log(msg)
@@ -903,8 +1012,12 @@ def prepare_syncplay_ini(url, trust_domain, log=None, path=None):
         parser.set(SYNCPLAY_SECTION, "forceguiprompt", "False")
         changed.append("forceguiprompt = False")
 
-    host = urlsplit(url).hostname if url else None
-    if trust_domain and host:
+    hosts = []
+    for u in urls:
+        h = urlsplit(u).hostname
+        if h and h not in hosts:
+            hosts.append(h)
+    if trust_domain and hosts:
         raw = parser.get(SYNCPLAY_SECTION, "trusteddomains", fallback="[]")
         try:
             domains = ast.literal_eval(raw)
@@ -912,10 +1025,11 @@ def prepare_syncplay_ini(url, trust_domain, log=None, path=None):
                 domains = []
         except Exception:
             domains = []
-        if host not in domains:
-            domains.append(host)
+        added = [h for h in hosts if h not in domains]
+        if added:
+            domains.extend(added)
             parser.set(SYNCPLAY_SECTION, "trusteddomains", repr(domains))
-            changed.append("trusteddomains += %s" % host)
+            changed.append("trusteddomains += %s" % ", ".join(added))
 
     if not changed:
         say("Syncplay's config already lets playback start on its own.")
@@ -932,6 +1046,389 @@ def prepare_syncplay_ini(url, trust_domain, log=None, path=None):
         return False
     say("Syncplay config (%s): %s" % (ini, "; ".join(changed)))
     return True
+
+
+# --------------------------------------------------------------------------- #
+# Library: Stremio's addons, spoken directly
+#
+# The manual loop this replaces was: open Stremio, let the Torrentio addon put
+# the episode on the debrid server, copy the link out, unrestrict it, paste it
+# into Syncplay's playlist. Stremio does nothing there that this app cannot —
+# Cinemeta is a plain JSON catalogue and Torrentio answers a plain JSON query.
+#
+# Torrentio takes the debrid key inside its URL path, so no URL built here is
+# ever logged or shown raw; everything user-visible goes through redact().
+# --------------------------------------------------------------------------- #
+
+
+class Series:
+    def __init__(self, imdb_id, name, year=""):
+        self.id = imdb_id
+        self.name = name
+        self.year = year
+
+    def label(self):
+        return "%s  ·  %s" % (self.name, self.year) if self.year else self.name
+
+
+class Episode:
+    def __init__(self, series_id, season, number, name="", released=""):
+        self.series_id = series_id
+        self.season = season
+        self.number = number
+        self.name = name
+        self.released = released
+
+    def code(self):
+        return "S%02dE%02d" % (self.season, self.number)
+
+    def stream_id(self):
+        """Stremio addressing: <imdb id>:<season>:<episode>."""
+        return "%s:%d:%d" % (self.series_id, self.season, self.number)
+
+    def label(self):
+        return "%s  ·  %s" % (self.code(), self.name) if self.name else self.code()
+
+
+class Source:
+    """One Torrentio result, parsed out of its two display strings."""
+
+    def __init__(self, quality="", size="", seeders=0, provider="",
+                 filename="", cached=None, url="", infohash=""):
+        self.quality = quality
+        self.size = size
+        self.seeders = seeders
+        self.provider = provider
+        self.filename = filename
+        # True = already on the debrid server, False = picking it starts a
+        # fresh download, None = Torrentio was queried without a debrid key.
+        self.cached = cached
+        self.url = url
+        self.infohash = infohash
+
+    def state_text(self):
+        if self.cached is True:
+            return "ready"
+        if self.cached is False:
+            return "needs download"
+        return "cache unknown"
+
+    def label(self):
+        bits = [self.quality or "?"]
+        if self.size:
+            bits.append(self.size)
+        if self.seeders:
+            bits.append("%d seeders" % self.seeders)
+        if self.provider:
+            bits.append(self.provider)
+        bits.append(self.state_text())
+        return "  ·  ".join(bits)
+
+
+_SEEDERS_RE = re.compile(r"👤\s*(\d+)")
+_SIZE_RE = re.compile(r"💾\s*([\d.]+\s*[KMGT]i?B)")
+_PROVIDER_RE = re.compile(r"⚙️\s*(\S+)")
+
+
+def _cache_state(name):
+    """Read Torrentio's debrid marker out of a stream's display name.
+
+    '[RD+]' means the file is already on the debrid server; '[RD download]'
+    means picking it starts one. No marker at all means the query carried no
+    key, so nothing can be said either way.
+    """
+    low = (name or "").lower()
+    if "[rd+]" in low:
+        return True
+    if "[rd" in low:
+        return False
+    return None
+
+
+def parse_source(raw):
+    """Turn one Torrentio stream object into a Source.
+
+    Shapes seen in the wild: without a debrid key a stream carries infoHash and
+    fileIdx, with one it also carries a resolver `url`. Both are accepted, and
+    which one arrived is worth logging the first time.
+    """
+    name = raw.get("name") or ""
+    title = raw.get("title") or ""
+    name_lines = name.splitlines()
+    title_lines = title.splitlines()
+    hints = raw.get("behaviorHints") or {}
+
+    seeders = _SEEDERS_RE.search(title)
+    size = _SIZE_RE.search(title)
+    provider = _PROVIDER_RE.search(title)
+
+    return Source(
+        quality=name_lines[1].strip() if len(name_lines) > 1 else "",
+        size=size.group(1).strip() if size else "",
+        seeders=int(seeders.group(1)) if seeders else 0,
+        provider=provider.group(1).strip() if provider else "",
+        filename=hints.get("filename") or (title_lines[1].strip() if len(title_lines) > 1 else ""),
+        cached=_cache_state(name),
+        url=raw.get("url") or "",
+        infohash=raw.get("infoHash") or "",
+    )
+
+
+def cinemeta_search(query, socks_port=None):
+    """Series matching a search term. Returns (series, error)."""
+    url = "%s/catalog/series/top/search=%s.json" % (CINEMETA, quote(query.strip()))
+    data, err = curl_json(url, socks_port=socks_port)
+    if data is None:
+        return [], err
+    found = []
+    for meta in data.get("metas") or []:
+        if meta.get("id"):
+            found.append(Series(meta["id"], meta.get("name") or meta["id"],
+                                meta.get("releaseInfo") or ""))
+    return found, ""
+
+
+def cinemeta_episodes(imdb_id, socks_port=None):
+    """Every real episode of a series. Returns (episodes, error).
+
+    Season 0 is where Cinemeta files specials and recaps. They are not part of
+    a watch-through, so they are dropped.
+    """
+    url = "%s/meta/series/%s.json" % (CINEMETA, quote(imdb_id))
+    data, err = curl_json(url, socks_port=socks_port, timeout=30)
+    if data is None:
+        return [], err
+    out = []
+    for vid in ((data.get("meta") or {}).get("videos") or []):
+        season = vid.get("season")
+        number = vid.get("episode", vid.get("number"))
+        if not isinstance(season, int) or not isinstance(number, int) or season < 1:
+            continue
+        out.append(Episode(imdb_id, season, number, vid.get("name") or "",
+                           (vid.get("released") or "")[:10]))
+    out.sort(key=lambda e: (e.season, e.number))
+    return out, ""
+
+
+def torrentio_url(cfg, stream_id):
+    """Build the Torrentio query. The debrid key ends up in the path."""
+    opts = [o.strip() for o in str(cfg["torrentio_opts"] or "").split("|") if o.strip()]
+    key = str(cfg["rd_api_key"] or "").strip()
+    if key:
+        opts = [o for o in opts if not o.lower().startswith("realdebrid=")]
+        opts.append("realdebrid=" + key)
+    prefix = ("/" + quote("|".join(opts), safe="|=,")) if opts else ""
+    return "%s%s/stream/series/%s.json" % (TORRENTIO, prefix, quote(stream_id))
+
+
+def torrentio_sources(cfg, stream_id, socks_port=None):
+    """Sources for one episode, best first. Returns (sources, error)."""
+    data, err = curl_json(torrentio_url(cfg, stream_id), socks_port=socks_port,
+                          timeout=40)
+    if data is None:
+        return [], err
+    return [parse_source(s) for s in (data.get("streams") or [])], ""
+
+
+def pick_source(sources, preferred=""):
+    """Best source: already cached wins, then the wanted quality, then seeders.
+
+    Cache state outranks quality on purpose — a 4k source that is not on the
+    debrid server yet is a wait, and the point of this is not waiting.
+    """
+    want = str(preferred or "").strip().lower()
+
+    def rank(s):
+        qual = (s.quality or "").strip().lower()
+        cached = 0 if s.cached else (1 if s.cached is None else 2)
+        # An exact match beats a partial one, so asking for 1080p does not land
+        # on "1080p 3D SBS" while a plain 1080p release is sitting right there.
+        if not want or qual == want:
+            matches = 0
+        elif want in qual:
+            matches = 1
+        else:
+            matches = 2
+        return (cached, matches, -s.seeders)
+
+    ranked = sorted(sources, key=rank)
+    return ranked[0] if ranked else None
+
+
+# --------------------------------------------------------------------------- #
+# Setting the shared playlist
+#
+# Syncplay's command line takes exactly one positional file, so a queue of
+# episodes cannot be handed over at launch. The playlist is room state on the
+# server (server.py setPlaylist), so the way to queue several is to join the
+# room as an ordinary client, set it, and leave.
+#
+# It has to happen *after* the real client is in the room: server.py's
+# _deleteRoomIfEmpty drops a room and its playlist the moment the last watcher
+# disconnects, so pushing into an empty room queues into nothing.
+# --------------------------------------------------------------------------- #
+
+SYNCPLAY_DEFAULT_PORT = 8999
+SYNCPLAY_PROTOCOL_VERSION = "1.7.5"
+
+
+class SyncplayPush:
+    """A short-lived Syncplay client that sets the room's shared playlist."""
+
+    def __init__(self, server, room, username, log=None):
+        host, _, port = str(server or "").strip().rpartition(":")
+        if not host:
+            host, port = port, ""
+        self.host = host
+        self.port = int(port) if port.isdigit() else SYNCPLAY_DEFAULT_PORT
+        self.room = room
+        self.username = username
+        self._log = log
+
+    def say(self, msg):
+        if self._log:
+            self._log(msg)
+
+    @staticmethod
+    def _send(fh, obj):
+        fh.write((json.dumps(obj) + "\r\n").encode("utf-8"))
+        fh.flush()
+
+    @staticmethod
+    def _read(fh):
+        line = fh.readline()
+        if not line:
+            return None
+        try:
+            return json.loads(line.decode("utf-8", "replace").strip() or "{}")
+        except ValueError:
+            return {}
+
+    def _connect(self, timeout):
+        """Open the connection, doing Syncplay's startTLS negotiation first."""
+        sock = socket.create_connection((self.host, self.port), timeout=timeout)
+        sock.settimeout(timeout)
+        fh = sock.makefile("rwb")
+        self._send(fh, {"TLS": {"startTLS": "send"}})
+        reply = self._read(fh) or {}
+        mode = str(((reply.get("TLS") or {}).get("startTLS") or "false")).lower()
+        if mode == "true":
+            # Verification is left on. A server that cannot be verified is
+            # exactly the warning the user should be seeing, not one to skip.
+            ctx = ssl.create_default_context()
+            sock = ctx.wrap_socket(sock, server_hostname=self.host)
+            sock.settimeout(timeout)
+            fh = sock.makefile("rwb")
+        return sock, fh
+
+    def _hello(self, fh):
+        self._send(fh, {"Hello": {
+            "username": self.username,
+            "room": {"name": self.room},
+            "version": SYNCPLAY_PROTOCOL_VERSION,
+            "realversion": SYNCPLAY_PROTOCOL_VERSION,
+            "features": {"sharedPlaylists": True, "chat": True,
+                         "featureList": True, "readiness": True,
+                         "managedRooms": True},
+        }})
+
+    def _pong(self, fh, msg):
+        """Answer the server's ping so it does not treat us as a dead client."""
+        ping = (msg.get("State") or {}).get("ping") or {}
+        self._send(fh, {"State": {
+            "ping": {
+                "latencyCalculation": ping.get("latencyCalculation"),
+                "clientLatencyCalculation": time.time(),
+            },
+            "playstate": {"position": 0.0, "paused": True, "doSeek": False},
+        }})
+
+    def _others(self, msg):
+        """Names in our room that are not us, from either message that carries
+        them: the List reply, and the Set/user event when somebody joins."""
+        seen = set()
+        listing = msg.get("List")
+        if isinstance(listing, dict):
+            for room, users in listing.items():
+                if room == self.room and isinstance(users, dict):
+                    seen.update(users)
+        users = (msg.get("Set") or {}).get("user")
+        if isinstance(users, dict):
+            for name, info in users.items():
+                room = ((info or {}).get("room") or {}).get("name")
+                if room in (None, self.room):
+                    seen.add(name)
+        seen.discard(self.username)
+        return seen
+
+    def push(self, files, index=0, wait=45.0, timeout=15.0):
+        """Set the room playlist once someone is there to keep it. (ok, message)."""
+        files = [f for f in (files or []) if f]
+        if not files:
+            return False, "Nothing to queue."
+        if len(files) > PLAYLIST_MAX_ITEMS:
+            return False, ("Syncplay caps a playlist at %d items and this is %d."
+                           % (PLAYLIST_MAX_ITEMS, len(files)))
+        total = sum(len(f) for f in files)
+        if total > PLAYLIST_MAX_CHARACTERS:
+            return False, ("Syncplay caps a playlist at %d characters and these %d "
+                           "links come to %d. Queue fewer episodes."
+                           % (PLAYLIST_MAX_CHARACTERS, len(files), total))
+        if not self.host:
+            return False, "No Syncplay server is set, so the queue has nowhere to go."
+
+        sock = fh = None
+        try:
+            sock, fh = self._connect(timeout)
+            self._hello(fh)
+
+            # Short reads so the roster can be re-requested while waiting.
+            sock.settimeout(2.0)
+            deadline = time.time() + wait
+            others = set()
+            next_ask = 0.0
+            while time.time() < deadline and not others:
+                # The roster has to be asked for. The server volunteers a
+                # Set/user frame when somebody joins *after* us, but says
+                # nothing about whoever is already sitting in the room — so a
+                # client that only listens never learns it has company.
+                if time.time() >= next_ask:
+                    self._send(fh, {"List": None})
+                    next_ask = time.time() + 3.0
+                try:
+                    msg = self._read(fh)
+                except (socket.timeout, TimeoutError):
+                    continue
+                if msg is None:
+                    return False, "The Syncplay server closed the connection."
+                if "State" in msg:
+                    self._pong(fh, msg)
+                others = self._others(msg)
+            sock.settimeout(timeout)
+
+            if not others:
+                return False, ("Nobody joined room '%s' within %ds, and a playlist set "
+                               "in an empty room is discarded by the server."
+                               % (self.room, int(wait)))
+
+            self._send(fh, {"Set": {"playlistChange": {"files": files}}})
+            self._send(fh, {"Set": {"playlistIndex": {"index": index}}})
+            # Let the server broadcast before the socket goes away.
+            time.sleep(1.0)
+            return True, ("Queued %d episode%s for %s."
+                          % (len(files), "" if len(files) == 1 else "s",
+                             ", ".join(sorted(others))))
+        except ssl.SSLError as exc:
+            return False, "Syncplay server's TLS could not be verified: %s" % exc
+        except OSError as exc:
+            return False, "Could not reach the Syncplay server: %s" % exc
+        finally:
+            for closer in (fh, sock):
+                try:
+                    if closer is not None:
+                        closer.close()
+                except Exception:
+                    pass
 
 
 # --------------------------------------------------------------------------- #
@@ -1262,10 +1759,7 @@ class Session:
                 cmd += ["-x", "http://127.0.0.1:%d" % self.cfg["http_port"]]
             else:
                 cmd += ["--noproxy", "*"]
-            env = dict(os.environ)
-            for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "all_proxy"):
-                env.pop(k, None)
-            rc, out, err = run(cmd + [url], timeout=15, env=env)
+            rc, out, err = run(cmd + [url], timeout=15, env=_scrubbed_env())
             ip = out.strip().splitlines()[0].strip() if out.strip() else ""
             if rc == 0 and re.fullmatch(r"[0-9a-fA-F:.]{7,45}", ip or ""):
                 return ip, url
@@ -1510,6 +2004,537 @@ class Row:
             self.label.set_text(text)
 
 
+def clear_list(listbox):
+    """Empty a ListBox. GTK4 has no remove_all, so walk the siblings."""
+    child = listbox.get_first_child()
+    while child:
+        nxt = child.get_next_sibling()
+        listbox.remove(child)
+        child = nxt
+
+
+def list_row(text, dim=False, payload=None, attr="item"):
+    """One padded row, with its object hung on as a plain Python attribute.
+
+    Same shape the environment and host pickers use, so every list in the app
+    reads and behaves the same way.
+    """
+    row = Gtk.ListBoxRow()
+    lbl = Gtk.Label(label=text, xalign=0)
+    lbl.set_wrap(True)
+    lbl.set_max_width_chars(64)
+    lbl.set_margin_top(8)
+    lbl.set_margin_bottom(8)
+    lbl.set_margin_start(10)
+    lbl.set_margin_end(10)
+    if dim:
+        lbl.add_css_class("dim")
+    row.set_child(lbl)
+    if payload is not None:
+        setattr(row, attr, payload)
+    return row
+
+
+def scrolled_list(mode=Gtk.SelectionMode.SINGLE, min_height=150, max_height=320):
+    """A ListBox in a vertical-only scroller. Returns (scroller, listbox)."""
+    lb = Gtk.ListBox()
+    lb.set_selection_mode(mode)
+    lb.add_css_class("boxed-list")
+    lb.set_hexpand(True)
+    sw = Gtk.ScrolledWindow()
+    sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    sw.set_min_content_height(min_height)
+    sw.set_max_content_height(max_height)
+    sw.set_hexpand(True)
+    sw.set_vexpand(True)
+    sw.set_child(lb)
+    return sw, lb
+
+
+class BrowseWindow(Gtk.Window):
+    """Pick a series and episodes, and put them on the shared playlist.
+
+    Four stages in a stack rather than one tall column: search, episodes, the
+    chosen sources, and the full source list for one episode.
+    """
+
+    def __init__(self, parent):
+        super().__init__(title="Browse", transient_for=parent, modal=True)
+        self.main = parent
+        self.cfg = parent.cfg
+        self.set_default_size(780, 700)
+
+        self.series = []
+        self.episodes = []
+        self.season = 0
+        self.picks = []        # [{"episode":…, "source":…, "sources":[…]}, …]
+        self.editing = None    # index into picks while the sources page is up
+        self.busy = False
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(box, "set_margin_" + side)(16)
+        self.set_child(box)
+
+        self.stack = Gtk.Stack()
+        self.stack.set_vexpand(True)
+        self.stack.add_named(self._page_search(), "search")
+        self.stack.add_named(self._page_episodes(), "episodes")
+        self.stack.add_named(self._page_review(), "review")
+        self.stack.add_named(self._page_sources(), "sources")
+        box.append(self.stack)
+
+        self.status = Gtk.Label(label="", xalign=0)
+        self.status.set_wrap(True)
+        self.status.set_max_width_chars(76)
+        self.status.add_css_class("dim")
+        box.append(self.status)
+
+        self.stack.set_visible_child_name("search")
+        self._resume_offer()
+
+    # -- pages ------------------------------------------------------------ #
+
+    def _page_search(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.search_entry = Gtk.Entry()
+        self.search_entry.set_hexpand(True)
+        self.search_entry.set_placeholder_text("Series name…")
+        self.search_entry.connect("activate", self.on_search)
+        bar.append(self.search_entry)
+        btn = Gtk.Button(label="Search")
+        btn.add_css_class("suggested-action")
+        btn.connect("clicked", self.on_search)
+        bar.append(btn)
+        page.append(bar)
+
+        sw, self.series_list = scrolled_list()
+        self.series_list.connect("row-activated", self.on_series_chosen)
+        page.append(sw)
+
+        self.resume_btn = Gtk.Button(label="")
+        self.resume_btn.connect("clicked", self.on_resume)
+        self.resume_btn.set_visible(False)
+        page.append(self.resume_btn)
+
+        hint = Gtk.Label(
+            label="Metadata comes from Cinemeta, the same catalogue Stremio uses. "
+                  "Nothing here touches your debrid account — that starts when you "
+                  "look for sources.",
+            xalign=0)
+        hint.set_wrap(True)
+        hint.set_max_width_chars(76)
+        hint.add_css_class("dim")
+        page.append(hint)
+        return page
+
+    def _page_episodes(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+
+        self.series_label = Gtk.Label(label="", xalign=0)
+        self.series_label.add_css_class("section-title")
+        page.append(self.series_label)
+
+        split = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        split.set_vexpand(True)
+        sw_s, self.season_list = scrolled_list(min_height=220)
+        sw_s.set_size_request(150, -1)
+        sw_s.set_hexpand(False)
+        self.season_list.connect("row-selected", self.on_season_selected)
+        split.append(sw_s)
+
+        sw_e, self.episode_list = scrolled_list(Gtk.SelectionMode.MULTIPLE,
+                                                min_height=220, max_height=420)
+        split.append(sw_e)
+        page.append(split)
+
+        hint = Gtk.Label(label="Tick one episode or several — ctrl-click and shift-click both work.",
+                         xalign=0)
+        hint.set_wrap(True)
+        hint.add_css_class("dim")
+        page.append(hint)
+
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        back = Gtk.Button(label="Back")
+        back.connect("clicked", lambda _b: self.stack.set_visible_child_name("search"))
+        bar.append(back)
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        bar.append(spacer)
+        self.btn_find = Gtk.Button(label="Find sources")
+        self.btn_find.add_css_class("suggested-action")
+        self.btn_find.connect("clicked", self.on_find_sources)
+        bar.append(self.btn_find)
+        page.append(bar)
+        return page
+
+    def _page_review(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+
+        lbl = Gtk.Label(label="These are the picks. Change any of them before adding.",
+                        xalign=0)
+        lbl.set_wrap(True)
+        lbl.add_css_class("dim")
+        page.append(lbl)
+
+        sw, self.review_list = scrolled_list(Gtk.SelectionMode.NONE,
+                                             min_height=260, max_height=440)
+        page.append(sw)
+
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        back = Gtk.Button(label="Back")
+        back.connect("clicked", lambda _b: self.stack.set_visible_child_name("episodes"))
+        bar.append(back)
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        bar.append(spacer)
+        self.btn_add = Gtk.Button(label="Add to playlist")
+        self.btn_add.add_css_class("suggested-action")
+        self.btn_add.connect("clicked", self.on_add)
+        bar.append(self.btn_add)
+        page.append(bar)
+        return page
+
+    def _page_sources(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+
+        self.sources_label = Gtk.Label(label="", xalign=0)
+        self.sources_label.add_css_class("section-title")
+        page.append(self.sources_label)
+
+        sw, self.source_list = scrolled_list(min_height=300, max_height=460)
+        self.source_list.connect("row-activated", self.on_source_chosen)
+        page.append(sw)
+
+        hint = Gtk.Label(
+            label="“ready” means the file is already on the debrid server and starts "
+                  "at once. “needs download” means picking it makes the server fetch "
+                  "the torrent first, which can take a while.",
+            xalign=0)
+        hint.set_wrap(True)
+        hint.set_max_width_chars(76)
+        hint.add_css_class("dim")
+        page.append(hint)
+
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        back = Gtk.Button(label="Back")
+        back.connect("clicked", lambda _b: self.stack.set_visible_child_name("review"))
+        bar.append(back)
+        page.append(bar)
+        return page
+
+    # -- helpers ---------------------------------------------------------- #
+
+    def say(self, text):
+        def apply():
+            self.status.set_text(text)
+            return False
+        GLib.idle_add(apply)
+
+    def set_busy(self, busy):
+        self.busy = busy
+        for btn in (self.btn_find, self.btn_add):
+            btn.set_sensitive(not busy)
+
+    def _key(self):
+        return str(self.cfg["rd_api_key"] or "").strip()
+
+    def _log(self, text):
+        """Main-window log, with the debrid key removed on the way out."""
+        self.main.log(redact(text, self._key()))
+
+    def _socks(self):
+        """The tunnel's port when it is actually up, else None for a direct route."""
+        if self.main.session.tunnel_alive():
+            return int(self.cfg["socks_port"])
+        return None
+
+    def _resume_offer(self):
+        sid = str(self.cfg["library_series_id"] or "").strip()
+        name = str(self.cfg["library_series_name"] or "").strip()
+        if not sid or not name:
+            return
+        season = int(self.cfg["library_season"] or 0)
+        ep = int(self.cfg["library_episode"] or 0)
+        where = " (last at S%02dE%02d)" % (season, ep) if season and ep else ""
+        self.resume_btn.set_label("Back to %s%s" % (name, where))
+        self.resume_btn.set_visible(True)
+
+    def on_resume(self, _btn):
+        sid = str(self.cfg["library_series_id"] or "").strip()
+        name = str(self.cfg["library_series_name"] or "").strip()
+        if sid:
+            self.open_series(Series(sid, name))
+
+    # -- search ----------------------------------------------------------- #
+
+    def on_search(self, _w):
+        query = self.search_entry.get_text().strip()
+        if not query:
+            self.say("Type a series name first.")
+            return
+        self.say("Searching…")
+        threading.Thread(target=self._search_worker, args=(query,), daemon=True).start()
+
+    def _search_worker(self, query):
+        found, err = cinemeta_search(query, socks_port=self._socks())
+
+        def apply():
+            clear_list(self.series_list)
+            self.series = found
+            if err:
+                self.status.set_text("Search failed: %s" % err)
+            elif not found:
+                self.status.set_text("Nothing matched “%s”." % query)
+            else:
+                self.status.set_text("%d result%s." % (len(found), "" if len(found) == 1 else "s"))
+            for s in found:
+                self.series_list.append(list_row(s.label(), payload=s, attr="series"))
+            return False
+
+        GLib.idle_add(apply)
+
+    def on_series_chosen(self, _list, row):
+        series = getattr(row, "series", None)
+        if series is not None:
+            self.open_series(series)
+
+    def open_series(self, series):
+        self.chosen_series = series
+        self.series_label.set_text(series.label())
+        clear_list(self.season_list)
+        clear_list(self.episode_list)
+        self.stack.set_visible_child_name("episodes")
+        self.say("Loading episodes…")
+        threading.Thread(target=self._episodes_worker, args=(series,), daemon=True).start()
+
+    def _episodes_worker(self, series):
+        eps, err = cinemeta_episodes(series.id, socks_port=self._socks())
+
+        def apply():
+            self.episodes = eps
+            clear_list(self.season_list)
+            if err or not eps:
+                self.status.set_text("Could not load episodes: %s" % (err or "none listed"))
+                return False
+            seasons = sorted({e.season for e in eps})
+            want = int(self.cfg["library_season"] or 0)
+            if series.id != str(self.cfg["library_series_id"] or "") or want not in seasons:
+                want = seasons[0]
+            chosen = None
+            for s in seasons:
+                row = list_row("Season %d" % s, payload=s, attr="season")
+                self.season_list.append(row)
+                if s == want:
+                    chosen = row
+            self.season_list.select_row(chosen or self.season_list.get_row_at_index(0))
+            self.status.set_text("%d episodes across %d seasons." % (len(eps), len(seasons)))
+            return False
+
+        GLib.idle_add(apply)
+
+    def on_season_selected(self, _list, row):
+        season = getattr(row, "season", None) if row is not None else None
+        if season is None:
+            return
+        self.season = season
+        clear_list(self.episode_list)
+        last_ep = int(self.cfg["library_episode"] or 0)
+        resume_here = (self.chosen_series.id == str(self.cfg["library_series_id"] or "")
+                       and season == int(self.cfg["library_season"] or 0))
+        pick = None
+        for ep in [e for e in self.episodes if e.season == season]:
+            r = list_row(ep.label(), payload=ep, attr="episode")
+            self.episode_list.append(r)
+            # Land on the one after wherever the last session stopped.
+            if resume_here and ep.number == last_ep + 1:
+                pick = r
+        if pick is not None:
+            self.episode_list.select_row(pick)
+
+    # -- sources ---------------------------------------------------------- #
+
+    def on_find_sources(self, _btn):
+        rows = self.episode_list.get_selected_rows()
+        chosen = [getattr(r, "episode", None) for r in rows]
+        chosen = [e for e in chosen if e is not None]
+        if not chosen:
+            self.say("Pick at least one episode.")
+            return
+        if not self._key():
+            self.say("No Real-Debrid key set — put one in Advanced first.")
+            self._log("Browse: no debrid key configured, so no sources can be looked up.")
+            return
+        chosen.sort(key=lambda e: (e.season, e.number))
+        self.set_busy(True)
+        self.say("Looking up sources for %d episode%s…"
+                 % (len(chosen), "" if len(chosen) == 1 else "s"))
+        threading.Thread(target=self._sources_worker, args=(chosen,), daemon=True).start()
+
+    def _sources_worker(self, episodes):
+        socks = self._socks()
+        picks = []
+        shape_logged = False
+        for i, ep in enumerate(episodes, 1):
+            self.say("Looking up %s (%d of %d)…" % (ep.code(), i, len(episodes)))
+            sources, err = torrentio_sources(self.cfg, ep.stream_id(), socks_port=socks)
+            if err:
+                self._log("Torrentio lookup failed for %s: %s" % (ep.code(), err))
+            if sources and not shape_logged:
+                # The debrid key changes Torrentio's reply shape. Say which one
+                # arrived rather than assuming it.
+                shape_logged = True
+                marked = sum(1 for s in sources if s.cached is True)
+                self._log("Torrentio replied with %s links; %d of %d marked ready."
+                          % ("resolvable" if sources[0].url else "info-hash only",
+                             marked, len(sources)))
+            picks.append({"episode": ep, "sources": sources,
+                          "source": pick_source(sources, self.cfg["preferred_quality"])})
+
+        def apply():
+            self.picks = picks
+            self._refresh_review()
+            self.stack.set_visible_child_name("review")
+            missing = sum(1 for p in picks if p["source"] is None)
+            uncached = sum(1 for p in picks if p["source"] is not None
+                           and p["source"].cached is False)
+            bits = []
+            if missing:
+                bits.append("%d with no source at all" % missing)
+            if uncached:
+                bits.append("%d not on the debrid server yet" % uncached)
+            self.status.set_text("; ".join(bits) if bits
+                                 else "Every episode has a source that is ready to play.")
+            self.set_busy(False)
+            return False
+
+        GLib.idle_add(apply)
+
+    def _refresh_review(self):
+        clear_list(self.review_list)
+        for i, pick in enumerate(self.picks):
+            ep, src = pick["episode"], pick["source"]
+            row = Gtk.ListBoxRow()
+            row.set_activatable(False)
+            line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            line.set_margin_top(8)
+            line.set_margin_bottom(8)
+            line.set_margin_start(10)
+            line.set_margin_end(10)
+
+            text = "%s\n%s" % (ep.label(), src.label() if src else "no source found")
+            lbl = Gtk.Label(label=text, xalign=0)
+            lbl.set_wrap(True)
+            lbl.set_hexpand(True)
+            lbl.set_max_width_chars(60)
+            if src is None:
+                lbl.add_css_class("result-fail")
+            elif src.cached is False:
+                lbl.add_css_class("result-warn")
+            line.append(lbl)
+
+            btn = Gtk.Button(label="Change…")
+            btn.set_valign(Gtk.Align.CENTER)
+            btn.connect("clicked", self.on_change, i)
+            btn.set_sensitive(bool(pick["sources"]))
+            line.append(btn)
+
+            row.set_child(line)
+            self.review_list.append(row)
+
+    def on_change(self, _btn, index):
+        self.editing = index
+        pick = self.picks[index]
+        self.sources_label.set_text("%s — %d sources"
+                                    % (pick["episode"].label(), len(pick["sources"])))
+        clear_list(self.source_list)
+        for src in pick["sources"]:
+            row = list_row("%s\n%s" % (src.label(), src.filename or ""),
+                           dim=(src.cached is False), payload=src, attr="source")
+            self.source_list.append(row)
+        self.stack.set_visible_child_name("sources")
+
+    def on_source_chosen(self, _list, row):
+        src = getattr(row, "source", None)
+        if src is None or self.editing is None:
+            return
+        self.picks[self.editing]["source"] = src
+        self.editing = None
+        self._refresh_review()
+        self.stack.set_visible_child_name("review")
+
+    # -- handing the queue over ------------------------------------------- #
+
+    def on_add(self, _btn):
+        usable = [p for p in self.picks if p["source"] is not None]
+        if not usable:
+            self.say("Nothing to add — none of these episodes has a source.")
+            return
+        if not self.main.session.tunnel_alive():
+            if self.cfg["require_verified"]:
+                self.say("The tunnel is not up. Run “Check the route” first so the "
+                         "links are made from the host's address, not this machine's.")
+                return
+            self._log("Browse: resolving debrid links without the tunnel, so they are "
+                      "tied to this machine's address rather than the host's.")
+        self.set_busy(True)
+        self.say("Resolving %d link%s…" % (len(usable), "" if len(usable) == 1 else "s"))
+        threading.Thread(target=self._resolve_worker, args=(usable,), daemon=True).start()
+
+    def _resolve_worker(self, picks):
+        """Resolve each pick to its final link.
+
+        Resolving here, once, is the point: the resolved link is what both
+        watchers get, so the debrid server sees one link fetched from one
+        address instead of each side resolving its own.
+        """
+        # Strictly one at a time. Resolving three at once was measured against
+        # the real service and every one of them timed out past 180s, while the
+        # same source resolved alone in about 80s — the resolver serialises per
+        # account, so overlapping the requests only starves all of them.
+        socks = self._socks()
+        urls, failed = [], []
+        for i, pick in enumerate(picks, 1):
+            ep, src = pick["episode"], pick["source"]
+            self.say("Resolving %s (%d of %d) — this takes up to a couple of minutes…"
+                     % (ep.code(), i, len(picks)))
+            if not src.url:
+                failed.append("%s (no resolvable link — is the debrid key set?)" % ep.code())
+                continue
+            final, err = curl_final_url(src.url, socks_port=socks)
+            if not final:
+                failed.append("%s (%s)" % (ep.code(), redact(err, self._key())))
+                continue
+            urls.append((ep, final))
+
+        def apply():
+            self.set_busy(False)
+            for note in failed:
+                self._log("Could not resolve " + note)
+            if not urls:
+                self.status.set_text("Nothing resolved. See the activity log.")
+                return False
+            self.main.adopt_queue([u for _e, u in urls])
+            last = urls[-1][0]
+            self.cfg["library_series_id"] = self.chosen_series.id
+            self.cfg["library_series_name"] = self.chosen_series.name
+            self.cfg["library_season"] = last.season
+            self.cfg["library_episode"] = last.number
+            self.cfg.save()
+            self._log("Queued %d episode%s: %s."
+                      % (len(urls), "" if len(urls) == 1 else "s",
+                         ", ".join(e.code() for e, _u in urls)))
+            if failed:
+                self._log("%d episode%s could not be resolved and were left out."
+                          % (len(failed), "" if len(failed) == 1 else "s"))
+            self.close()
+            return False
+
+        GLib.idle_add(apply)
+
+
 class Window(Gtk.ApplicationWindow):
     def __init__(self, app, cfg, autolaunch=False):
         super().__init__(application=app, title=APP_NAME)
@@ -1524,6 +2549,9 @@ class Window(Gtk.ApplicationWindow):
         self.peers = []
         self.tailscale_self = None
         self.host_count_timer = None
+        # Episodes queued by the browser. The first one launches with Syncplay
+        # as its positional file; the rest are pushed to the room afterwards.
+        self.queue = []
 
         header = Gtk.HeaderBar()
         self.header = header
@@ -2016,20 +3044,54 @@ class Window(Gtk.ApplicationWindow):
 
         self._entry(grid, 0, "URL", "play_url",
                     "https://…  — leave blank to pick a file in Syncplay yourself",
-                    width=2)
+                    width=1)
+
+        browse = Gtk.Button(label="Browse…")
+        browse.connect("clicked", self.on_browse)
+        grid.attach(browse, 2, 0, 1, 1)
+
+        self.queue_note = Gtk.Label(label="", xalign=0)
+        self.queue_note.set_wrap(True)
+        self.queue_note.set_hexpand(True)
+        self.queue_note.set_max_width_chars(60)
+        self.queue_note.set_visible(False)
+        grid.attach(self.queue_note, 0, 1, 3, 1)
 
         note = Gtk.Label(
             label="A URL here is handed to Syncplay, which puts it on the shared "
                   "playlist — so it starts for everyone in the room, whoever typed it. "
                   "It also skips Syncplay's setup dialog, which only stays away while a "
-                  "URL is set.",
+                  "URL is set. Browse… finds episodes and fills this in for you.",
             xalign=0)
         note.set_wrap(True)
         note.set_hexpand(True)
         note.set_max_width_chars(60)
         note.add_css_class("dim")
-        grid.attach(note, 0, 1, 3, 1)
+        grid.attach(note, 0, 2, 3, 1)
         return frame
+
+    def on_browse(self, _btn):
+        self.collect()
+        BrowseWindow(self).present()
+
+    def adopt_queue(self, urls):
+        """Take the browser's episode list.
+
+        The first URL rides the existing path — Syncplay's positional file, which
+        it puts on the shared playlist itself. The rest wait for _launch_worker,
+        because a playlist set before anyone is in the room is discarded.
+        """
+        self.queue = list(urls)
+        if not self.queue:
+            return
+        self.e_play_url.set_text(self.queue[0])
+        self.cfg["play_url"] = self.queue[0]
+        if len(self.queue) > 1:
+            self.queue_note.set_text("%d episodes queued. They go on the shared playlist "
+                                     "once Syncplay is in the room." % len(self.queue))
+            self.queue_note.set_visible(True)
+        else:
+            self.queue_note.set_visible(False)
 
     def on_rescan(self, _btn=None):
         self.collect()
@@ -2178,10 +3240,25 @@ class Window(Gtk.ApplicationWindow):
         self._entry(grid, 6, "Room", "syncplay_room", "")
         self._entry(grid, 7, "Display name", "syncplay_user", "")
         self._entry(grid, 8, "Extra mpv flags", "mpv_extra", "--cache=yes --demuxer-max-bytes=200M")
-        self._switch(grid, 9, "Require a verified route before launching", "require_verified")
-        self._switch(grid, 10, "Stop the container when the tunnel drops", "stop_container_on_drop")
-        self._switch(grid, 11, "Skip Syncplay's setup dialog", "skip_syncplay_dialog")
-        self._switch(grid, 12, "Trust the domain of the URL being played", "trust_play_domain")
+        key = self._entry(grid, 9, "Real-Debrid API key", "rd_api_key",
+                          "from real-debrid.com/apitoken")
+        # It is a password in every way that matters, so it is not left on screen.
+        key.set_visibility(False)
+        self._entry(grid, 10, "Torrentio options", "torrentio_opts", "sort=qualitysize")
+        self._entry(grid, 11, "Preferred quality", "preferred_quality", "1080p")
+        self._switch(grid, 12, "Require a verified route before launching", "require_verified")
+        self._switch(grid, 13, "Stop the container when the tunnel drops", "stop_container_on_drop")
+        self._switch(grid, 14, "Skip Syncplay's setup dialog", "skip_syncplay_dialog")
+        self._switch(grid, 15, "Trust the domain of the URL being played", "trust_play_domain")
+
+        note = Gtk.Label(
+            label="The Real-Debrid key is stored in config.json, which is written "
+                  "owner-only. It grants full access to that account.",
+            xalign=0)
+        note.set_wrap(True)
+        note.set_max_width_chars(64)
+        note.add_css_class("dim")
+        grid.attach(note, 0, 16, 2, 1)
 
         exp.set_child(frame)
         return exp
@@ -2605,7 +3682,11 @@ class Window(Gtk.ApplicationWindow):
             self.log("No URL set, so Syncplay will show its setup dialog — it forces "
                      "the dialog whenever no file is given, whatever the config says.")
             return
-        prepare_syncplay_ini(url, bool(self.cfg["trust_play_domain"]), log=self.log)
+        # Every queued episode's domain is trusted up front. A season can span
+        # more than one debrid host, and an untrusted one interrupts playback
+        # with a confirmation halfway through.
+        prepare_syncplay_ini(self.queue or [url], bool(self.cfg["trust_play_domain"]),
+                             log=self.log)
         self.log("Syncplay will open %s and put it on the shared playlist for the room."
                  % url)
         if not self.cfg["trust_play_domain"]:
@@ -2632,6 +3713,30 @@ class Window(Gtk.ApplicationWindow):
         GLib.idle_add(self.on_state, "playing-host" if host_mode else "playing")
         if not host_mode:
             notify(APP_NAME, "Connected. Syncplay is starting.")
+        if len(self.queue) > 1:
+            self._push_queue()
+
+    def _push_queue(self):
+        """Put the queued episodes on the room's shared playlist.
+
+        Deliberately after the player is up: the server drops a room, and its
+        playlist with it, the moment the last watcher leaves, so a queue pushed
+        before Syncplay has joined would be queued into nothing.
+        """
+        server = str(self.cfg["syncplay_server"] or "").strip()
+        room = str(self.cfg["syncplay_room"] or "").strip()
+        if not server or not room:
+            self.log("Queued %d episodes, but the Syncplay server and room have to be "
+                     "set in Advanced for the rest of them to be sent. Only the first "
+                     "one will play." % len(self.queue))
+            return
+        user = str(self.cfg["syncplay_user"] or "").strip() or "tunnel"
+        pusher = SyncplayPush(server, room, "%s-queue" % user, log=self.log)
+        ok, msg = pusher.push(self.queue)
+        self.log(msg)
+        if not ok:
+            self.log("The first episode still plays — only the rest of the queue was "
+                     "lost. Everything is on the shared playlist once it works.")
 
     def on_stop(self, _btn):
         threading.Thread(target=lambda: self.session.stop_all("user"), daemon=True).start()

@@ -248,6 +248,69 @@ will fail while no tunnel is up. The app logs this when it happens.
 
 ---
 
+## Finding episodes without leaving the app
+
+**Browse…**, next to the URL field, replaces the loop of opening Stremio, letting
+the Torrentio addon put an episode on the debrid server, copying the link out,
+unrestricting it and pasting it into Syncplay's playlist.
+
+Search a series, pick a season, tick one episode or a dozen, and the app looks up
+sources for each of them. It picks the best one itself — already on the debrid
+server first, then your preferred quality, then seeders — and shows you what it
+chose, with **Change…** on any row to see the full list for that episode:
+quality, size, seeders, provider, and whether it is ready or would need
+downloading first. **Add to playlist** resolves them and fills in the URL field.
+
+Metadata comes from [Cinemeta](https://v3-cinemeta.strem.io) and sources from
+[Torrentio](https://torrentio.strem.fun) — the same two addons Stremio itself
+uses, spoken directly over plain JSON.
+
+### One link, one address
+
+Each episode is resolved **once, through the tunnel**, and the resolved link is
+what goes on the shared playlist. Both of you then fetch the identical URL
+through your own tunnels to the same exit, so the debrid account sees one link
+being fetched from one address. Resolving separately on each machine would defeat
+that, which is why the app refuses to resolve at all while the tunnel is down and
+**Require a verified route** is on.
+
+Resolution is not instant — Torrentio has to get a link back from the debrid
+service, which measured anywhere from a couple of seconds to about ninety even
+for a source marked ready. A queue is resolved a few episodes at a time so a
+season does not take longer than an episode.
+
+### Queueing more than one
+
+Syncplay's command line takes exactly one file, so only the first episode can be
+handed over at launch. The rest are pushed to the room afterwards, over Syncplay's
+own protocol, once the app's Syncplay has joined — a playlist set in an empty room
+is discarded by the server, so the timing is deliberate. This needs **Syncplay
+server** and **Room** set in Advanced; without them only the first episode plays,
+and the app says so.
+
+Syncplay caps a playlist at 250 items and 10000 characters total. Debrid links run
+about 140 characters, so roughly 70 episodes fit. Past that the app refuses with
+the count rather than letting the server drop it silently.
+
+Every queued episode's domain is added to Syncplay's `trustedDomains` up front,
+because a season can span more than one debrid host and an untrusted one
+interrupts playback with a confirmation halfway through.
+
+### The API key
+
+**Real-Debrid API key** in Advanced, from
+[real-debrid.com/apitoken](https://real-debrid.com/apitoken). It is stored in
+`~/.config/syncplay-tunnel/config.json`, which the app writes owner-only, and it
+grants full access to that account.
+
+The key travels inside the Torrentio URL, exactly as it does in the Stremio addon
+today — so Torrentio's server can see it and touches the debrid account from its
+own address. Nothing here changes that; it is the same arrangement already in use.
+What the app does guarantee is that the key never reaches the activity log or the
+log file: anything that might carry one of those URLs is redacted first.
+
+---
+
 ## Install
 
 ### Recommended: native (all three targets have GTK4 already)
@@ -321,7 +384,8 @@ On the **host machine**: sshd running, Tailscale up. Nothing else.
 1. **Pick your mode** in the title bar, then choose a host from the peer list
    (Client) or check the reported details (Host).
 2. **What to play** — optional. A URL here starts for both of you and skips
-   Syncplay's setup dialog.
+   Syncplay's setup dialog. **Browse…** finds episodes and fills it in for you;
+   run *Check the route* first, since links are resolved through the tunnel.
 3. **Where to play** — pick the system or container from the list. *Rescan*
    re-checks, and *Install* fills in whatever is missing there.
 4. **Check the route** — watch the seven rows. Client mode only; the host
@@ -348,13 +412,18 @@ only launches if it passes.
 | Watchdog interval | 10 s | How often the tunnel is tested. |
 | Failures before stopping | 3 | Consecutive failures before everything is killed. |
 | Extra mpv flags | — | Appended to the wrapper, e.g. `--cache=yes --demuxer-max-bytes=200M`. |
-| Require a verified route | on | Leave this on. It's the whole point. |
+| Real-Debrid API key | — | From [real-debrid.com/apitoken](https://real-debrid.com/apitoken). Needed by **Browse…**; kept out of every log. |
+| Torrentio options | `sort=qualitysize` | Pipe-joined, e.g. `sort=seeders\|qualityfilter=480p,scr,cam`. A `realdebrid=` here is replaced by the key above. |
+| Preferred quality | `1080p` | Matched exactly first, so it won't settle for `1080p 3D SBS` while a plain 1080p release exists. |
+| Require a verified route | on | Leave this on. It's the whole point — it also blocks link resolution while the tunnel is down. |
 | Stop the container on drop | on | Shuts the distrobox down too when the tunnel dies. |
 | Skip Syncplay's setup dialog | on | Writes `forceguiprompt = False` to `~/.config/syncplay.ini`. Only takes effect when a URL is set. |
 | Trust the domain of the URL | on | Adds the URL's hostname to Syncplay's `trustedDomains`, on this machine only. |
 
 Syncplay server, room, and display name are optional — leave them blank to use
-Syncplay's own saved settings.
+Syncplay's own saved settings. **Queueing more than one episode needs the server
+and room filled in**, because the queue is pushed to that room over Syncplay's
+protocol after launch.
 
 ---
 

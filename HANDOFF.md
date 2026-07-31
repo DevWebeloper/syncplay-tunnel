@@ -311,9 +311,15 @@ ensure_ssh_key(), ssh_copy_id()      pty-based enrolment
 Runtime, probe_native(), list_distroboxes(), probe_container(), scan_runtimes()
 install_plan(), stream_command()     installing syncplay/mpv per environment
 syncplay_ini_path(), prepare_syncplay_ini()
+redact(), curl_json(), curl_final_url()      library networking, via curl
+Series, Episode, Source, parse_source()
+cinemeta_search/_episodes, torrentio_url/_sources, pick_source()
+SyncplayPush       joins the room, sets the shared playlist, leaves
 socks5_connect(), _BridgeHandler, HttpBridge
 Session            tunnel, watchdog, wrapper, launch, teardown
-Row, Window, App   GTK4 UI
+Row, clear_list(), list_row(), scrolled_list()
+BrowseWindow       search / episodes / review / sources
+Window, App        GTK4 UI
 ```
 
 ---
@@ -382,8 +388,15 @@ systems already ship GTK4.
 | `skip_syncplay_dialog` | `true` | Writes `forceguiprompt = False` into Syncplay's ini. Needs `play_url` to have any effect |
 | `trust_play_domain` | `true` | Appends `play_url`'s hostname to Syncplay's `trustedDomains` |
 | `mpv_extra` | `""` | Appended to the wrapper |
-| `require_verified` | `true` | **Leave on.** Blocks launch until the route passes |
+| `require_verified` | `true` | **Leave on.** Blocks launch until the route passes, and blocks link resolution while the tunnel is down |
 | `stop_container_on_drop` | `true` | Stops the distrobox when the tunnel dies |
+| `rd_api_key` | `""` | Real-Debrid token. Travels inside the Torrentio URL; redacted from every log |
+| `torrentio_opts` | `sort=qualitysize` | Pipe-joined Torrentio path options. A `realdebrid=` here is replaced by the key above |
+| `preferred_quality` | `1080p` | Matched exactly first, then as a substring |
+| `library_series_id` | `""` | Bookmark: last series browsed |
+| `library_series_name` | `""` | Bookmark: its display name |
+| `library_season` | `0` | Bookmark: last season |
+| `library_episode` | `0` | Bookmark: last episode queued; the browser preselects the next one |
 
 Logs: `~/.local/share/syncplay-tunnel/session.log`, plus the live Activity pane.
 
@@ -643,3 +656,144 @@ makes the compositor pair the window with the right icon.
 Not covered by the app, worth setting on the host by hand: `ListenAddress
 <tailscale-ip>` and `AllowUsers <your-user>` in `sshd_config` — §15.6 still stands,
 the host-mode check is only a TCP probe and cannot see the bound interface.
+
+---
+
+## 17. Third round — the library browser
+
+The manual loop this removes: open Stremio, let the Torrentio+RD addon put an
+episode on the debrid server, copy the link, unrestrict it, paste it into
+Syncplay's playlist. Repeat per episode. Stremio does nothing there that this app
+cannot — both addons are plain JSON over HTTP.
+
+### 17.1 Shapes confirmed against the live services
+
+Not derived from documentation; captured and asserted against in the tests.
+
+**Cinemeta** (`https://v3-cinemeta.strem.io`, no key):
+
+- `/catalog/series/top/search=<q>.json` → `metas[]`, each `{id: "tt0903747",
+  name, releaseInfo: "2008-2013", poster}`.
+- `/meta/series/<id>.json` → `meta.videos[]`, each `{id: "tt0903747:1:2",
+  season, episode, name, released}`. Breaking Bad returns 67 videos across
+  seasons **0–5**; season 0 is specials and is dropped, leaving 62.
+
+**Torrentio** (`https://torrentio.strem.fun/<opts>/stream/series/<id>:<s>:<e>.json`).
+The debrid key changes the reply shape, which is why `parse_source()` accepts both:
+
+| | without a key | with `realdebrid=<key>` |
+|---|---|---|
+| streams for `tt0903747:1:2` | 50 | 82 |
+| identifier | `infoHash` + `fileIdx` | `url` (a `/resolve/realdebrid/<key>/<hash>/null/<idx>/<name>` endpoint) |
+| cache marker | none | `[RD+]` cached / `[RD download]` not — 46 of 82 were cached |
+
+`name` is `"<addon>\n<quality>"`; `title` is `"<torrent>\n<file>\n👤 seeders 💾 size ⚙️ provider"`.
+
+**Resolution** — GET the `url` with `-r 0-0` (a HEAD gets 405 from some CDNs, and
+without a range this downloads the episode). Lands on
+`https://<n>-<n>.download.real-debrid.com/d/<id>/<filename>`, HTTP 206, ~141
+characters.
+
+### 17.2 Resolution is slow, and must not be parallelised
+
+Measured, twice, on a source marked `[RD+]`: **80.7s and 84.1s**. Not a
+warm-up — the second run was no faster.
+
+The obvious response was a small thread pool. It was implemented, measured, and
+**reverted**: three concurrent resolutions all timed out past 180s, where one
+alone took 80s. Torrentio's resolver serialises per account, so overlapping the
+requests starves every one of them. `_resolve_worker` is deliberately a plain
+loop, and `curl_final_url`'s timeout is 180s for the same reason.
+
+Sequentially, the same three episodes took **318s total** — about 106s each, and
+all three succeeded. Consequence worth knowing: a five-episode queue is roughly
+nine minutes of resolving before anything plays. If that ever needs fixing, the
+route is resolving the first episode, launching, and resolving the rest in the
+background before the push — not concurrency.
+
+### 17.3 Setting the shared playlist
+
+Syncplay's command line takes exactly one positional file, so a queue cannot be
+handed over at launch. The playlist is room state on the server, so `SyncplayPush`
+joins the room as an ordinary client, sets it, and leaves.
+
+Confirmed from `/usr/lib/syncplay/syncplay/`:
+
+- `protocols.py:350-362` — `{"Set": {"playlistChange": {"files": [...]}}}` and
+  `{"Set": {"playlistIndex": {"index": n}}}`.
+- `server.py:234-241` — accepted if `room.canControl(watcher)` and
+  `playlistIsValid(files)`.
+- `utils.py:440-445` + `constants.py:84-85` — **250 items, 10000 characters
+  total**. At ~141 characters a link that is about 70 episodes.
+- `server.py:498-506` — `_deleteRoomIfEmpty` destroys the room *and its
+  playlist* when the last watcher leaves.
+
+That last one is the whole reason the push happens after `launch_player`, not
+before: a playlist set in an empty room is discarded.
+
+**The trap that cost the most time.** The client must *ask* for the roster.
+Dumping raw frames after `Hello` showed the server sends `Set/ready`,
+`Set/playlistChange`, `Set/playlistIndex`, `Hello`, then `State` pings — and **no
+`List`, and no `Set/user` for anyone already in the room**. `Set/user` only
+arrives when somebody joins *after* you. A client that merely listens therefore
+concludes it is alone and refuses to push. Syncplay's own client sends
+`{"List": null}` (`protocols.py:252`, called from `:234`), and the server replies
+`{"List": {"<room>": {"<user>": {...}}}}`. `SyncplayPush` re-asks every 3s while
+waiting, with a 2s socket timeout so the loop keeps turning.
+
+It also answers `State` pings, so the server does not treat it as a dead client
+during the wait.
+
+### 17.4 One link, one address
+
+Each episode is resolved **once**, through the tunnel, and the resolved link is
+what goes on the shared playlist — so both machines fetch the identical URL
+through their own tunnels to the same exit. Resolving per-machine would put two
+addresses on the debrid account, which is the constraint the whole app exists to
+satisfy. Hence `on_add()` refuses to resolve while the tunnel is down and
+`require_verified` is on.
+
+The key itself goes to Torrentio, which touches the account from its own address.
+That is unchanged from the Stremio addon already in use and was the user's
+explicit choice; the alternative (calling the debrid API directly from here) was
+offered and declined.
+
+### 17.5 Keeping the key out of the logs
+
+The key sits in the Torrentio URL path, so any message carrying one would leak it
+into `session.log`. `redact(text, *secrets)` blanks it, `BrowseWindow._log()`
+routes every message through it, and secrets shorter than 8 characters are
+ignored so a blank key cannot redact the whole message. The entry field uses
+`set_visibility(False)`.
+
+### 17.6 Testing this round
+
+- `test_library.py`, **61 checks**, offline against fixtures captured from the
+  live services: redaction, Cinemeta search and episode parsing (specials
+  dropped, seasons 1–5 kept), Torrentio parsing (quality, 84 seeders, 5.17 GB,
+  ThePirateBay, infoHash kept, cache unknown without a key), the `[RD+]` /
+  `[RD download]` markers, source ranking (**exact quality beats a partial match**
+  so `1080p` does not land on `1080p 3D SBS`; cached beats uncached; seeders
+  break ties), URL building including replacement of a stale `realdebrid=` in the
+  options, the playlist message shapes byte-for-byte against Syncplay's own, room
+  membership parsing from both frame types, and multi-URL `trustedDomains` with
+  the BOM and `%%` escaping intact.
+- `test_browse_ui.py`, **38 checks**, the real windows built on the real display
+  and never shown: the masked key field, `collect()` round-tripping the new keys,
+  bookmarks surviving `collect()`, `adopt_queue` filling the URL field and the
+  queue note, all four stack pages, multi-select on episodes, the review list,
+  Change… replacing a pick and returning, the busy guards, both refusals firing
+  before any network call, and the log redaction.
+- **Live against a real Syncplay server**: playlist push arrives at the other
+  client with the index; **it survives the pusher disconnecting and is handed to a
+  client that joins afterwards** (the girlfriend's-machine case); an empty room is
+  refused with the reason; a dead port and a blank server are refused cleanly.
+- **Live against the real services**, driving `BrowseWindow._resolve_worker`
+  itself with three real episodes: 91/82/83 sources found, all three picks
+  `[RD+]`, all three resolved (318s), links distinct, none carrying the key, the
+  queue reaching the main window, the URL field filled from it, and the bookmark
+  advanced to S01E03. 398 characters for three links, so ~75 fit the cap.
+
+Not covered: the Silverblue render, and a real two-machine watch-through, which
+needs her laptop online — it was offline (last seen 3h) throughout this round, so
+the protocol work was verified against a local `syncplay-server` instead.
