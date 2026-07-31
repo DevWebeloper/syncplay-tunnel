@@ -1,7 +1,7 @@
 # Syncplay Tunnel — Handoff
 
 **Status:** feature-complete, syntax- and unit-tested, **never run on real hardware**
-**Last updated:** 26 July 2026
+**Last updated:** 31 July 2026
 
 ---
 
@@ -178,8 +178,8 @@ The current container name is read from `$CONTAINER_ID`, falling back to parsing
 
 ## 7. Two modes
 
-A switcher in the title bar (`Gtk.Stack` + `Gtk.StackSwitcher`), titled **Client**
-and **Host**. The stack child names stay `client`/`host`, so `cfg["role"]` and
+A switcher at the top of the **Route** view (`Gtk.Stack` + `Gtk.StackSwitcher`),
+titled **Client** and **Host** — it lived in the title bar until §18. The stack child names stay `client`/`host`, so `cfg["role"]` and
 every branch reading it are unaffected by the label change.
 
 **Client** — lists every Tailscale peer with hostname, address, OS and
@@ -297,7 +297,7 @@ differently across GTK builds.
 | `syncplay-tunnel.svg` | Icon. |
 | `README.md` | User-facing documentation. |
 
-**Dependencies:** PyGObject with GTK4, `ssh`, `curl`. Optional: `tailscale`,
+**Dependencies:** PyGObject with GTK4 **and libadwaita**, `ssh`, `curl`. Optional: `tailscale`,
 `distrobox`, `podman`, `flatpak`, `notify-send`. Everything else is stdlib.
 
 ### Code layout inside `syncplay-tunnel.py`
@@ -306,6 +306,7 @@ differently across GTK builds.
 helpers            which / in_container / run / notify / port_open / free_port
                    ssh_clients() / is_tailscale_addr()
 Config             JSON at ~/.config/syncplay-tunnel/config.json, mode 600
+JsonStore          atomic 0600 writes; Cache and History extend it
 Peer, tailscale_status()
 ensure_ssh_key(), ssh_copy_id()      pty-based enrolment
 Runtime, probe_native(), list_distroboxes(), probe_container(), scan_runtimes()
@@ -317,9 +318,9 @@ cinemeta_search/_episodes, torrentio_url/_sources, pick_source()
 SyncplayPush       joins the room, sets the shared playlist, leaves
 socks5_connect(), _BridgeHandler, HttpBridge
 Session            tunnel, watchdog, wrapper, launch, teardown
-Row, clear_list(), list_row(), scrolled_list()
+Row, clear_list(), list_row(), scrolled_list(), block_scroll_steal()
 BrowseWindow       search / episodes / review / sources
-Window, App        GTK4 UI
+Window, App        libadwaita UI: split view, five views, preferences page
 ```
 
 ---
@@ -797,3 +798,130 @@ ignored so a blank key cannot redact the whole message. The entry field uses
 Not covered: the Silverblue render, and a real two-machine watch-through, which
 needs her laptop online — it was offline (last seen 3h) throughout this round, so
 the protocol work was verified against a local `syncplay-server` instead.
+
+---
+
+## 18. Fourth round — the interface rebuild
+
+Four asks: the scroll bug, caching, a watch history, and the layout itself.
+
+### 18.1 Scrolling over Advanced changed the values
+
+Not a quirk — a real defect that had already corrupted the live config. When the
+new settings page first rendered it showed **8081 / 8119 / 23 / 11 / 9** where the
+defaults are 8080 / 8118 / 22 / 10 / 3. Every one had been nudged by scrolling
+past it, and `host_ssh_port` had reached **23**, which would have broken SSH
+outright. Restored by hand.
+
+The cause, from `observe_controllers()`:
+
+| Widget | Scroll controllers |
+|---|---|
+| `Gtk.ScrolledWindow` | one **capture**, one **bubble** |
+| `Gtk.SpinButton` | one **bubble** |
+| `Adw.SpinRow` (outer) | none — its spin button is an internal child |
+
+Bubble runs deepest-first, so the spin button's controller fired before the
+scroller's and consumed the event.
+
+`block_scroll_steal()` adds a **capture**-phase controller, which runs top-down
+and therefore before the spin button. Returning `True` there also stops the
+scroller's bubble handler, so the page would have frozen instead — the handler
+therefore scrolls the ancestor `Gtk.ScrolledWindow` itself. Attaching it to the
+`Adw.SpinRow` covers the nested spin button for the same top-down reason.
+
+`dy` arrives already in scroll units. An early version multiplied it by three,
+which made the page jump ~177px per notch over a spin row and ~59px everywhere
+else; the multiplier is gone.
+
+Tested by emitting a real scroll at the guard and asserting the value did not
+move while the adjustment did — 14 checks, including clamping at both ends and
+a spin row with no ancestor scroller.
+
+### 18.2 Cache and history
+
+`JsonStore` holds the shared plumbing (atomic `.tmp` + replace, 0600, a lock, a
+corrupt file starting empty rather than raising). `Cache` and `History` extend it.
+
+TTLs: **searches 7 days, episode lists 24 hours, source lists 6 hours** — sources
+shortest because cache state moves and new releases appear. Capped at 400
+entries, evicted oldest-first. `cinemeta_search`, `cinemeta_episodes` and
+`torrentio_sources` each take `cache=` and `refresh=`, and the browser's Refresh
+button sets `refresh`.
+
+**The debrid key must not reach the cache.** Torrentio embeds it in the URL path,
+so `Source.to_dict(key)` swaps it for `KEY_TOKEN` and `from_dict(key)` puts it
+back; the cache *key* for a source list is built from the options string with
+`redact()` applied. Asserted by reading the written file's bytes.
+
+Resolved links are not cached at all — they expire, and a stale one fails
+mid-episode.
+
+`History` keeps 30 entries, most recent first, de-duplicated by series id so a
+re-watch moves to the front and updates the episode. The old single-slot
+`library_*` bookmark still exists and is carried into the history once by
+`_seed_history()`.
+
+### 18.3 The rebuild
+
+`Adw.ApplicationWindow` → `Adw.ToastOverlay` → `Adw.NavigationSplitView`, with a
+five-row sidebar (`VIEWS`) driving an `Adw.ViewStack`: Watch, Route, Where, Setup,
+Activity. Start and Stop live in the content `Adw.ToolbarView`'s bottom bar, so
+they are reachable from every view.
+
+**What made this tractable**: the exploration produced a cross-reference of every
+widget mutated from outside its builder, and those attribute names were kept
+verbatim — `pill`, `verdict`, `where_note`, `env_detail`, `btn_install`,
+`btn_test`, `results`, `rows`, `btn_stop`, `btn_launch`, `logview`, `logbuf`,
+`queue_note`, `e_play_url`, `env_list`, `peer_list`, `host_*_label`,
+`host_share`, `btn_restrict`, `runtimes`, `stack`. Every worker and handler was
+left alone.
+
+`collect()` needed **no changes at all**: `Adw.EntryRow` implements
+`Gtk.Editable`, `Adw.SpinRow` has `value`, `Adw.SwitchRow` has `active`, so the
+`e_`/`s_`/`w_` prefix convention kept working through the swap.
+
+Two ordering traps:
+
+- `_build_sidebar()` selects its first row as it builds, which fires
+  `on_nav_selected`, which needs the views and `content_page` to exist. Content
+  is therefore built first.
+- The host status labels stayed `Gtk.Label`s inside `Adw.ActionRow` suffixes
+  rather than becoming row subtitles, because the workers call `set_text()` on
+  each by name.
+
+`Adw.EntryRow` has no placeholder and no subtitle, so entry hints moved to
+tooltips and to `Adw.PreferencesGroup` descriptions. `Adw.SwitchRow` and
+`Adw.SpinRow` do have subtitles, which is where the long explanatory paragraphs
+went — a readability win over the dim labels they replace.
+
+**Settings now save themselves** ~900ms after the last edit, so the "Save
+settings" button is gone. This bit during testing: suites that build the real
+`Window` were writing to the real config, and one of them left
+`require_verified` **off**. Restored, and every UI suite now points
+`st.CONFIG_FILE` at a scratch directory.
+
+### 18.4 Verifying it without a screenshot
+
+The compositor refuses `org.gnome.Shell.Screenshot` (`AccessDenied`), so each
+view is rendered offscreen instead: `Gtk.WidgetPaintable` → `Gtk.Snapshot` →
+`renderer.render_texture()` → `save_to_png`. `render.py` writes one PNG per view.
+That is how the corrupted port values in §18.1 were spotted at all.
+
+### 18.5 Testing this round
+
+- `test_scroll.py` — 14 checks, above.
+- `test_store.py` — 43 checks: TTLs against a faked clock, capping and
+  oldest-first eviction, reload, 0600, corrupt-file recovery, **the key absent
+  from the written bytes**, history ordering/dedupe/cap/forget/clear, and
+  `entries()` returning copies.
+- `test_shell.py` — 43 checks: five views, sidebar navigation and title
+  tracking, **every `DEFAULTS` key still bound except the eight that were never
+  widgets**, row types, a scroll guard on all five spins, `collect()` round trip,
+  Continue watching including the next-episode subtitle, forget, the stored-data
+  counters, and Resume carrying season/episode into the browser.
+- `test_library.py` (61) and `test_browse_ui.py` (40) still pass, the latter
+  updated for the Adw widgets.
+
+Not covered: the app under a real user's hands on Silverblue, and a two-machine
+watch-through — her laptop was offline for this round too.

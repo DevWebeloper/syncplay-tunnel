@@ -15,10 +15,25 @@ Zero pip dependencies. Needs: python3-gobject + gtk4, ssh, curl.
 import gi
 
 gi.require_version("Gtk", "4.0")
+try:
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw  # noqa: E402
+except (ValueError, ImportError) as _adw_error:  # pragma: no cover - depends on host
+    import sys as _sys
+
+    _sys.stderr.write(
+        "Syncplay Tunnel needs libadwaita (%s).\n"
+        "  Arch:   sudo pacman -S --needed libadwaita\n"
+        "  Debian: sudo apt install -y gir1.2-adw-1\n"
+        "  Fedora: sudo dnf install -y libadwaita\n" % _adw_error
+    )
+    raise SystemExit(1)
+
 from gi.repository import Gtk, Gdk, GLib, Gio  # noqa: E402
 
 import ast
 import configparser
+import copy
 import ipaddress
 import json
 import os
@@ -47,6 +62,23 @@ CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / 
 CONFIG_FILE = CONFIG_DIR / "config.json"
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "syncplay-tunnel"
 LOG_FILE = DATA_DIR / "session.log"
+CACHE_FILE = DATA_DIR / "cache.json"
+HISTORY_FILE = DATA_DIR / "history.json"
+
+# How long a cached answer stays good. Sources are shortest because what the
+# debrid service already holds changes, and new releases appear.
+CACHE_TTL = {
+    "search": 7 * 86400,
+    "episodes": 24 * 3600,
+    "sources": 6 * 3600,
+}
+CACHE_MAX_ENTRIES = 400
+HISTORY_MAX = 30
+
+# Stand-in for the debrid key inside anything written to disk. Torrentio puts
+# the key in its URL path, so a cached source list would otherwise leak it into
+# a file that exists purely for speed.
+KEY_TOKEN = "{KEY}"
 
 # Public-IP echo services, tried in order. Plain HTTP variants are kept as a
 # fallback because some SOCKS paths choke on TLS through odd MTUs.
@@ -317,6 +349,117 @@ class Config(dict):
         tmp.write_text(json.dumps(dict(self), indent=2) + "\n")
         tmp.replace(CONFIG_FILE)
         CONFIG_FILE.chmod(0o600)
+
+
+class JsonStore:
+    """Shared plumbing for the two small JSON files beside the config.
+
+    Same atomic write as Config -- write a sibling .tmp, then replace -- so a
+    crash mid-write cannot leave a half-parsed file behind, and the same 0600
+    mode, because both of these can end up holding things worth protecting.
+    """
+
+    def __init__(self, path, empty):
+        self.path = Path(path)
+        self._empty = empty
+        self._lock = threading.Lock()
+        self.data = copy.deepcopy(empty)
+        self.load()
+
+    def load(self):
+        try:
+            if self.path.exists():
+                loaded = json.loads(self.path.read_text())
+                if isinstance(loaded, type(self._empty)):
+                    self.data = loaded
+        except Exception:
+            # A corrupt cache or history is not worth a failed start; the file
+            # is rewritten on the next save.
+            self.data = copy.deepcopy(self._empty)
+
+    def save(self):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp.write_text(json.dumps(self.data) + "\n")
+            tmp.replace(self.path)
+            self.path.chmod(0o600)
+        except OSError:
+            pass
+
+    def clear(self):
+        with self._lock:
+            self.data = copy.deepcopy(self._empty)
+        self.save()
+
+
+class Cache(JsonStore):
+    """Answers from Cinemeta and Torrentio, kept for a while.
+
+    Those services change slowly, and re-fetching a series you opened a minute
+    ago is pure waiting. Resolved debrid links are deliberately NOT stored --
+    they expire, and a stale one fails in the middle of an episode.
+    """
+
+    def __init__(self, path=None):
+        super().__init__(path or CACHE_FILE, {})
+
+    def get(self, namespace, key, now=None):
+        ttl = CACHE_TTL.get(namespace, 3600)
+        now = time.time() if now is None else now
+        with self._lock:
+            entry = self.data.get("%s:%s" % (namespace, key))
+            if not isinstance(entry, dict):
+                return None
+            if now - entry.get("at", 0) > ttl:
+                return None
+            return entry.get("data")
+
+    def put(self, namespace, key, value, now=None):
+        now = time.time() if now is None else now
+        with self._lock:
+            self.data["%s:%s" % (namespace, key)] = {"at": now, "data": value}
+            if len(self.data) > CACHE_MAX_ENTRIES:
+                # Oldest first, so a long browsing session cannot grow the file
+                # without bound.
+                for stale in sorted(self.data,
+                                    key=lambda k: self.data[k].get("at", 0)
+                                    )[:len(self.data) - CACHE_MAX_ENTRIES]:
+                    self.data.pop(stale, None)
+        self.save()
+
+    def count(self):
+        with self._lock:
+            return len(self.data)
+
+
+class History(JsonStore):
+    """What was watched, most recent first."""
+
+    def __init__(self, path=None):
+        super().__init__(path or HISTORY_FILE, [])
+
+    def remember(self, series_id, name, year="", season=0, episode=0, now=None):
+        """Record a series, moving it to the front and folding in a re-watch."""
+        if not series_id:
+            return
+        now = time.time() if now is None else now
+        with self._lock:
+            kept = [e for e in self.data if e.get("id") != series_id]
+            kept.insert(0, {"id": series_id, "name": name, "year": year,
+                            "season": int(season or 0), "episode": int(episode or 0),
+                            "at": now})
+            self.data = kept[:HISTORY_MAX]
+        self.save()
+
+    def forget(self, series_id):
+        with self._lock:
+            self.data = [e for e in self.data if e.get("id") != series_id]
+        self.save()
+
+    def entries(self):
+        with self._lock:
+            return [dict(e) for e in self.data if e.get("id")]
 
 
 # --------------------------------------------------------------------------- #
@@ -1070,6 +1213,13 @@ class Series:
     def label(self):
         return "%s  ·  %s" % (self.name, self.year) if self.year else self.name
 
+    def to_dict(self):
+        return {"id": self.id, "name": self.name, "year": self.year}
+
+    @staticmethod
+    def from_dict(d):
+        return Series(d.get("id", ""), d.get("name", ""), d.get("year", ""))
+
 
 class Episode:
     def __init__(self, series_id, season, number, name="", released=""):
@@ -1088,6 +1238,15 @@ class Episode:
 
     def label(self):
         return "%s  ·  %s" % (self.code(), self.name) if self.name else self.code()
+
+    def to_dict(self):
+        return {"series_id": self.series_id, "season": self.season,
+                "number": self.number, "name": self.name, "released": self.released}
+
+    @staticmethod
+    def from_dict(d):
+        return Episode(d.get("series_id", ""), int(d.get("season", 0)),
+                       int(d.get("number", 0)), d.get("name", ""), d.get("released", ""))
 
 
 class Source:
@@ -1123,6 +1282,25 @@ class Source:
             bits.append(self.provider)
         bits.append(self.state_text())
         return "  ·  ".join(bits)
+
+    def to_dict(self, key=""):
+        """Serialise for the cache, with the debrid key swapped for a token."""
+        url = self.url
+        if key and len(key) >= 8:
+            url = url.replace(key, KEY_TOKEN)
+        return {"quality": self.quality, "size": self.size, "seeders": self.seeders,
+                "provider": self.provider, "filename": self.filename,
+                "cached": self.cached, "url": url, "infohash": self.infohash}
+
+    @staticmethod
+    def from_dict(d, key=""):
+        url = d.get("url", "")
+        if key and KEY_TOKEN in url:
+            url = url.replace(KEY_TOKEN, key)
+        return Source(quality=d.get("quality", ""), size=d.get("size", ""),
+                      seeders=int(d.get("seeders", 0)), provider=d.get("provider", ""),
+                      filename=d.get("filename", ""), cached=d.get("cached"),
+                      url=url, infohash=d.get("infohash", ""))
 
 
 _SEEDERS_RE = re.compile(r"👤\s*(\d+)")
@@ -1174,9 +1352,14 @@ def parse_source(raw):
     )
 
 
-def cinemeta_search(query, socks_port=None):
+def cinemeta_search(query, socks_port=None, cache=None, refresh=False):
     """Series matching a search term. Returns (series, error)."""
-    url = "%s/catalog/series/top/search=%s.json" % (CINEMETA, quote(query.strip()))
+    query = query.strip()
+    if cache is not None and not refresh:
+        hit = cache.get("search", query.lower())
+        if hit is not None:
+            return [Series.from_dict(d) for d in hit], ""
+    url = "%s/catalog/series/top/search=%s.json" % (CINEMETA, quote(query))
     data, err = curl_json(url, socks_port=socks_port)
     if data is None:
         return [], err
@@ -1185,15 +1368,21 @@ def cinemeta_search(query, socks_port=None):
         if meta.get("id"):
             found.append(Series(meta["id"], meta.get("name") or meta["id"],
                                 meta.get("releaseInfo") or ""))
+    if cache is not None and found:
+        cache.put("search", query.lower(), [s.to_dict() for s in found])
     return found, ""
 
 
-def cinemeta_episodes(imdb_id, socks_port=None):
+def cinemeta_episodes(imdb_id, socks_port=None, cache=None, refresh=False):
     """Every real episode of a series. Returns (episodes, error).
 
     Season 0 is where Cinemeta files specials and recaps. They are not part of
     a watch-through, so they are dropped.
     """
+    if cache is not None and not refresh:
+        hit = cache.get("episodes", imdb_id)
+        if hit is not None:
+            return [Episode.from_dict(d) for d in hit], ""
     url = "%s/meta/series/%s.json" % (CINEMETA, quote(imdb_id))
     data, err = curl_json(url, socks_port=socks_port, timeout=30)
     if data is None:
@@ -1207,6 +1396,8 @@ def cinemeta_episodes(imdb_id, socks_port=None):
         out.append(Episode(imdb_id, season, number, vid.get("name") or "",
                            (vid.get("released") or "")[:10]))
     out.sort(key=lambda e: (e.season, e.number))
+    if cache is not None and out:
+        cache.put("episodes", imdb_id, [e.to_dict() for e in out])
     return out, ""
 
 
@@ -1221,13 +1412,24 @@ def torrentio_url(cfg, stream_id):
     return "%s%s/stream/series/%s.json" % (TORRENTIO, prefix, quote(stream_id))
 
 
-def torrentio_sources(cfg, stream_id, socks_port=None):
+def torrentio_sources(cfg, stream_id, socks_port=None, cache=None, refresh=False):
     """Sources for one episode, best first. Returns (sources, error)."""
+    key = str(cfg["rd_api_key"] or "").strip()
+    # The cache key describes the query, so it must not be the key itself --
+    # the options string is what changes the answer, minus the secret in it.
+    ckey = "%s|%s" % (stream_id, redact(str(cfg["torrentio_opts"] or ""), key))
+    if cache is not None and not refresh:
+        hit = cache.get("sources", ckey)
+        if hit is not None:
+            return [Source.from_dict(d, key) for d in hit], ""
     data, err = curl_json(torrentio_url(cfg, stream_id), socks_port=socks_port,
                           timeout=40)
     if data is None:
         return [], err
-    return [parse_source(s) for s in (data.get("streams") or [])], ""
+    found = [parse_source(s) for s in (data.get("streams") or [])]
+    if cache is not None and found:
+        cache.put("sources", ckey, [s.to_dict(key) for s in found])
+    return found, ""
 
 
 def pick_source(sources, preferred=""):
@@ -2004,6 +2206,41 @@ class Row:
             self.label.set_text(text)
 
 
+def block_scroll_steal(widget):
+    """Stop a spin control eating scroll meant for the page underneath it.
+
+    GtkScrolledWindow scrolls from a bubble-phase controller, and GtkSpinButton
+    has a bubble-phase scroll controller of its own. Bubble runs deepest-first,
+    so the spin button always won: scrolling past the port fields changed the
+    ports instead of moving the page.
+
+    A capture-phase controller here runs before the spin button ever sees the
+    event, because capture goes top-down. Swallowing it there also stops the
+    scroller's own bubble handler, though, which would freeze the page instead
+    — so the delta is handed to the enclosing scroller by hand. Attaching this
+    to an AdwSpinRow covers the spin button nested inside it for the same
+    top-down reason.
+    """
+    ctrl = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.BOTH_AXES)
+    ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+
+    def on_scroll(_ctrl, _dx, dy):
+        scroller = widget.get_ancestor(Gtk.ScrolledWindow)
+        if scroller is not None:
+            adj = scroller.get_vadjustment()
+            # dy already arrives in scroll units, so one step per unit is what
+            # the scroller would have done itself. Multiplying it makes the page
+            # jump several times faster over a spin row than anywhere else.
+            step = adj.get_step_increment() or 50
+            top = max(adj.get_lower(), adj.get_upper() - adj.get_page_size())
+            adj.set_value(min(max(adj.get_value() + dy * step, adj.get_lower()), top))
+        return True
+
+    ctrl.connect("scroll", on_scroll)
+    widget.add_controller(ctrl)
+    return widget
+
+
 def clear_list(listbox):
     """Empty a ListBox. GTK4 has no remove_all, so walk the siblings."""
     child = listbox.get_first_child()
@@ -2051,7 +2288,7 @@ def scrolled_list(mode=Gtk.SelectionMode.SINGLE, min_height=150, max_height=320)
     return sw, lb
 
 
-class BrowseWindow(Gtk.Window):
+class BrowseWindow(Adw.Window):
     """Pick a series and episodes, and put them on the shared playlist.
 
     Four stages in a stack rather than one tall column: search, episodes, the
@@ -2059,10 +2296,10 @@ class BrowseWindow(Gtk.Window):
     """
 
     def __init__(self, parent):
-        super().__init__(title="Browse", transient_for=parent, modal=True)
+        super().__init__(title="Browse", transient_for=parent, modal=False)
         self.main = parent
         self.cfg = parent.cfg
-        self.set_default_size(780, 700)
+        self.set_default_size(820, 760)
 
         self.series = []
         self.episodes = []
@@ -2070,13 +2307,20 @@ class BrowseWindow(Gtk.Window):
         self.picks = []        # [{"episode":…, "source":…, "sources":[…]}, …]
         self.editing = None    # index into picks while the sources page is up
         self.busy = False
+        # Where Resume asked us to land: the season, and the episode already
+        # watched, so selection falls on the one after it.
+        self.resume_season = 0
+        self.resume_after = 0
+        # Set by the Refresh control: bypass the cache for the next lookup, so
+        # a stale source list is never a dead end.
+        self.refresh = False
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         for side in ("top", "bottom", "start", "end"):
             getattr(box, "set_margin_" + side)(16)
-        self.set_child(box)
 
         self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
         self.stack.set_vexpand(True)
         self.stack.add_named(self._page_search(), "search")
         self.stack.add_named(self._page_episodes(), "episodes")
@@ -2090,8 +2334,15 @@ class BrowseWindow(Gtk.Window):
         self.status.add_css_class("dim")
         box.append(self.status)
 
+        self.toaster = Adw.ToastOverlay()
+        self.toaster.set_child(box)
+        bar = Adw.ToolbarView()
+        bar.add_top_bar(Adw.HeaderBar())
+        bar.set_content(self.toaster)
+        self.set_content(bar)
+
         self.stack.set_visible_child_name("search")
-        self._resume_offer()
+        self._fill_recent()
 
     # -- pages ------------------------------------------------------------ #
 
@@ -2110,25 +2361,55 @@ class BrowseWindow(Gtk.Window):
         bar.append(btn)
         page.append(bar)
 
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic")
+        refresh.set_tooltip_text("Search again, ignoring anything remembered")
+        refresh.connect("clicked", self.on_search_fresh)
+        bar.append(refresh)
+
         sw, self.series_list = scrolled_list()
         self.series_list.connect("row-activated", self.on_series_chosen)
         page.append(sw)
 
-        self.resume_btn = Gtk.Button(label="")
-        self.resume_btn.connect("clicked", self.on_resume)
-        self.resume_btn.set_visible(False)
-        page.append(self.resume_btn)
+        self.recent_label = Gtk.Label(label="Recently watched", xalign=0)
+        self.recent_label.add_css_class("section-title")
+        page.append(self.recent_label)
+
+        sw2, self.recent_list = scrolled_list(min_height=90, max_height=200)
+        self.recent_list.connect("row-activated", self.on_recent_chosen)
+        page.append(sw2)
 
         hint = Gtk.Label(
-            label="Metadata comes from Cinemeta, the same catalogue Stremio uses. "
-                  "Nothing here touches your debrid account — that starts when you "
-                  "look for sources.",
+            label="Metadata comes from Cinemeta, the same catalogue Stremio uses, and "
+                  "answers are remembered for a week. Nothing here touches your debrid "
+                  "account — that starts when you look for sources.",
             xalign=0)
         hint.set_wrap(True)
         hint.set_max_width_chars(76)
         hint.add_css_class("dim")
         page.append(hint)
         return page
+
+    def _fill_recent(self):
+        clear_list(self.recent_list)
+        entries = self.main.history.entries()
+        self.recent_label.set_visible(bool(entries))
+        self.recent_list.get_parent().set_visible(bool(entries))
+        for entry in entries:
+            season = int(entry.get("season") or 0)
+            episode = int(entry.get("episode") or 0)
+            text = entry.get("name") or entry.get("id")
+            if season and episode:
+                text += "  ·  next S%02dE%02d" % (season, episode + 1)
+            self.recent_list.append(list_row(text, payload=entry, attr="entry"))
+
+    def on_recent_chosen(self, _list, row):
+        entry = getattr(row, "entry", None)
+        if entry is None:
+            return
+        self.open_series(Series(entry.get("id", ""), entry.get("name") or "",
+                                entry.get("year") or ""),
+                         season=int(entry.get("season") or 0),
+                         after=int(entry.get("episode") or 0))
 
     def _page_episodes(self):
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -2251,23 +2532,6 @@ class BrowseWindow(Gtk.Window):
             return int(self.cfg["socks_port"])
         return None
 
-    def _resume_offer(self):
-        sid = str(self.cfg["library_series_id"] or "").strip()
-        name = str(self.cfg["library_series_name"] or "").strip()
-        if not sid or not name:
-            return
-        season = int(self.cfg["library_season"] or 0)
-        ep = int(self.cfg["library_episode"] or 0)
-        where = " (last at S%02dE%02d)" % (season, ep) if season and ep else ""
-        self.resume_btn.set_label("Back to %s%s" % (name, where))
-        self.resume_btn.set_visible(True)
-
-    def on_resume(self, _btn):
-        sid = str(self.cfg["library_series_id"] or "").strip()
-        name = str(self.cfg["library_series_name"] or "").strip()
-        if sid:
-            self.open_series(Series(sid, name))
-
     # -- search ----------------------------------------------------------- #
 
     def on_search(self, _w):
@@ -2278,8 +2542,14 @@ class BrowseWindow(Gtk.Window):
         self.say("Searching…")
         threading.Thread(target=self._search_worker, args=(query,), daemon=True).start()
 
+    def on_search_fresh(self, _btn):
+        """Search past whatever was remembered."""
+        self.refresh = True
+        self.on_search(None)
+
     def _search_worker(self, query):
-        found, err = cinemeta_search(query, socks_port=self._socks())
+        found, err = cinemeta_search(query, socks_port=self._socks(),
+                                     cache=self.main.cache, refresh=self.refresh)
 
         def apply():
             clear_list(self.series_list)
@@ -2301,8 +2571,12 @@ class BrowseWindow(Gtk.Window):
         if series is not None:
             self.open_series(series)
 
-    def open_series(self, series):
+    def open_series(self, series, season=0, after=0):
+        """Show a series. `season`/`after` land on the episode following one
+        already watched, which is what Resume means."""
         self.chosen_series = series
+        self.resume_season = int(season or 0)
+        self.resume_after = int(after or 0)
         self.series_label.set_text(series.label())
         clear_list(self.season_list)
         clear_list(self.episode_list)
@@ -2311,7 +2585,8 @@ class BrowseWindow(Gtk.Window):
         threading.Thread(target=self._episodes_worker, args=(series,), daemon=True).start()
 
     def _episodes_worker(self, series):
-        eps, err = cinemeta_episodes(series.id, socks_port=self._socks())
+        eps, err = cinemeta_episodes(series.id, socks_port=self._socks(),
+                                     cache=self.main.cache, refresh=self.refresh)
 
         def apply():
             self.episodes = eps
@@ -2320,8 +2595,8 @@ class BrowseWindow(Gtk.Window):
                 self.status.set_text("Could not load episodes: %s" % (err or "none listed"))
                 return False
             seasons = sorted({e.season for e in eps})
-            want = int(self.cfg["library_season"] or 0)
-            if series.id != str(self.cfg["library_series_id"] or "") or want not in seasons:
+            want = self.resume_season
+            if want not in seasons:
                 want = seasons[0]
             chosen = None
             for s in seasons:
@@ -2341,15 +2616,13 @@ class BrowseWindow(Gtk.Window):
             return
         self.season = season
         clear_list(self.episode_list)
-        last_ep = int(self.cfg["library_episode"] or 0)
-        resume_here = (self.chosen_series.id == str(self.cfg["library_series_id"] or "")
-                       and season == int(self.cfg["library_season"] or 0))
+        resume_here = season == self.resume_season and self.resume_after > 0
         pick = None
         for ep in [e for e in self.episodes if e.season == season]:
             r = list_row(ep.label(), payload=ep, attr="episode")
             self.episode_list.append(r)
             # Land on the one after wherever the last session stopped.
-            if resume_here and ep.number == last_ep + 1:
+            if resume_here and ep.number == self.resume_after + 1:
                 pick = r
         if pick is not None:
             self.episode_list.select_row(pick)
@@ -2379,7 +2652,8 @@ class BrowseWindow(Gtk.Window):
         shape_logged = False
         for i, ep in enumerate(episodes, 1):
             self.say("Looking up %s (%d of %d)…" % (ep.code(), i, len(episodes)))
-            sources, err = torrentio_sources(self.cfg, ep.stream_id(), socks_port=socks)
+            sources, err = torrentio_sources(self.cfg, ep.stream_id(), socks_port=socks,
+                                             cache=self.main.cache, refresh=self.refresh)
             if err:
                 self._log("Torrentio lookup failed for %s: %s" % (ep.code(), err))
             if sources and not shape_logged:
@@ -2518,6 +2792,9 @@ class BrowseWindow(Gtk.Window):
                 return False
             self.main.adopt_queue([u for _e, u in urls])
             last = urls[-1][0]
+            self.main.history.remember(self.chosen_series.id, self.chosen_series.name,
+                                       self.chosen_series.year, last.season, last.number)
+            self.main.refresh_history()
             self.cfg["library_series_id"] = self.chosen_series.id
             self.cfg["library_series_name"] = self.chosen_series.name
             self.cfg["library_season"] = last.season
@@ -2535,11 +2812,22 @@ class BrowseWindow(Gtk.Window):
         GLib.idle_add(apply)
 
 
-class Window(Gtk.ApplicationWindow):
+# The five views, in sidebar order. Watch is what gets opened every day; the
+# rest are there when something needs setting or explaining.
+VIEWS = [
+    ("watch", "Watch", "media-playback-start-symbolic"),
+    ("route", "Route", "network-transmit-receive-symbolic"),
+    ("where", "Where", "computer-symbolic"),
+    ("setup", "Setup", "preferences-system-symbolic"),
+    ("activity", "Activity", "text-x-generic-symbolic"),
+]
+
+
+class Window(Adw.ApplicationWindow):
     def __init__(self, app, cfg, autolaunch=False):
         super().__init__(application=app, title=APP_NAME)
         self.cfg = cfg
-        self.set_default_size(720, 820)
+        self.set_default_size(940, 720)
         self.session = Session(cfg, self.log, self.on_state)
         self.verified = False
         self.busy = False
@@ -2552,96 +2840,186 @@ class Window(Gtk.ApplicationWindow):
         # Episodes queued by the browser. The first one launches with Syncplay
         # as its positional file; the rest are pushed to the room afterwards.
         self.queue = []
+        self.cache = Cache()
+        self.history = History()
+        self._seed_history()
+        self._save_timer = None
 
-        header = Gtk.HeaderBar()
-        self.header = header
+        self.toaster = Adw.ToastOverlay()
+        self.set_content(self.toaster)
+
+        self.views = Adw.ViewStack()
+        self.views.set_vexpand(True)
+
+        split = Adw.NavigationSplitView()
+        split.set_min_sidebar_width(180)
+        split.set_max_sidebar_width(240)
+        # Content first: the sidebar selects its first row as it is built, which
+        # fires on_nav_selected, which needs the views and the page to exist.
+        content = self._build_content()
+        split.set_sidebar(self._build_sidebar())
+        split.set_content(content)
+        self.toaster.set_child(split)
+
+        self.on_role_changed()
+        self._env_banner()
+        threading.Thread(target=self._scan_worker, daemon=True).start()
+        self.refresh_peers()
+        self.refresh_history()
+        if autolaunch:
+            GLib.timeout_add(600, self._auto)
+
+    # -- shell ------------------------------------------------------------ #
+
+    def _build_sidebar(self):
+        self.nav = Gtk.ListBox()
+        self.nav.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.nav.add_css_class("navigation-sidebar")
+        for name, title, icon in VIEWS:
+            row = Gtk.ListBoxRow()
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            box.set_margin_top(10)
+            box.set_margin_bottom(10)
+            box.set_margin_start(6)
+            box.set_margin_end(6)
+            box.append(Gtk.Image.new_from_icon_name(icon))
+            box.append(Gtk.Label(label=title, xalign=0))
+            row.set_child(box)
+            row.view_name = name
+            self.nav.append(row)
+        self.nav.connect("row-selected", self.on_nav_selected)
+        self.nav.select_row(self.nav.get_row_at_index(0))
+
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_vexpand(True)
+        scroller.set_child(self.nav)
+
+        bar = Adw.ToolbarView()
+        bar.add_top_bar(Adw.HeaderBar())
+        bar.set_content(scroller)
+        return Adw.NavigationPage(child=bar, title=APP_NAME)
+
+    def _build_content(self):
+        self.views.add_titled(self._build_watch(), "watch", "Watch")
+        self.views.add_titled(self._build_route(), "route", "Route")
+        self.views.add_titled(self._build_where(), "where", "Where")
+        self.views.add_titled(self._build_setup(), "setup", "Setup")
+        self.views.add_titled(self._build_log(), "activity", "Activity")
+
+        header = Adw.HeaderBar()
         self.pill = Gtk.Label(label="Not connected")
         self.pill.add_css_class("pill")
         self.pill.add_css_class("pill-idle")
         header.pack_end(self.pill)
-        self.set_titlebar(header)
 
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self.set_child(outer)
+        bar = Adw.ToolbarView()
+        bar.add_top_bar(header)
+        bar.set_content(self.views)
+        # Start and Stop belong to no single view -- they are the point of the
+        # whole window, so they sit under all of them.
+        bar.add_bottom_bar(self._build_actions())
+        self.content_page = Adw.NavigationPage(child=bar, title="Watch")
+        return self.content_page
 
+    def on_nav_selected(self, _list, row):
+        name = getattr(row, "view_name", None) if row is not None else None
+        if not name:
+            return
+        self.views.set_visible_child_name(name)
+        for key, title, _icon in VIEWS:
+            if key == name:
+                self.content_page.set_title(title)
+                break
+
+    def show_view(self, name):
+        for i, (key, _t, _i) in enumerate(VIEWS):
+            if key == name:
+                self.nav.select_row(self.nav.get_row_at_index(i))
+                return
+
+    def toast(self, text):
+        self.toaster.add_toast(Adw.Toast(title=text, timeout=3))
+
+    # -- setting rows ----------------------------------------------------- #
+    #
+    # collect() finds every bound widget by the e_/s_/w_ prefix on this object,
+    # so these keep storing under exactly the names it expects. AdwEntryRow
+    # implements GtkEditable and AdwSpinRow/AdwSwitchRow carry value/active, so
+    # the reading side needed no changes at all.
+
+    def _entry(self, group, label, key, hint="", password=False):
+        row = Adw.PasswordEntryRow(title=label) if password else Adw.EntryRow(title=label)
+        row.set_text(str(self.cfg[key]))
+        if hint:
+            # AdwEntryRow has no placeholder and no subtitle, and the hints are
+            # worth keeping, so they live in the tooltip and in the group
+            # description above.
+            row.set_tooltip_text(hint)
+        row.connect("changed", self._on_setting_changed)
+        group.add(row)
+        setattr(self, "e_" + key, row)
+        return row
+
+    def _spin(self, group, label, key, lo, hi, subtitle=""):
+        row = Adw.SpinRow.new_with_range(lo, hi, 1)
+        row.set_title(label)
+        if subtitle:
+            row.set_subtitle(subtitle)
+        row.set_value(int(self.cfg[key]))
+        block_scroll_steal(row)
+        row.connect("notify::value", self._on_setting_changed)
+        group.add(row)
+        setattr(self, "s_" + key, row)
+        return row
+
+    def _switch(self, group, label, key, subtitle=""):
+        row = Adw.SwitchRow(title=label)
+        if subtitle:
+            row.set_subtitle(subtitle)
+        row.set_active(bool(self.cfg[key]))
+        row.connect("notify::active", self._on_setting_changed)
+        group.add(row)
+        setattr(self, "w_" + key, row)
+        return row
+
+    def _on_setting_changed(self, *_a):
+        """Save shortly after the last edit, so nothing is lost to a stray close."""
+        if self._save_timer is not None:
+            GLib.source_remove(self._save_timer)
+        self._save_timer = GLib.timeout_add(900, self._save_now)
+
+    def _save_now(self):
+        self._save_timer = None
+        self.collect()
+        self.cfg.save()
+        return False
+
+    def _view(self, spacing=18):
+        """The shape every view shares: a clamped, scrolling column of groups."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=spacing)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(box, "set_margin_" + side)(18)
+        clamp = Adw.Clamp(maximum_size=760)
+        clamp.set_child(box)
         scroller = Gtk.ScrolledWindow()
-        scroller.set_vexpand(True)
         scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        outer.append(scroller)
+        scroller.set_vexpand(True)
+        scroller.set_child(clamp)
+        return scroller, box
 
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
-        for side in ("top", "bottom", "start", "end"):
-            getattr(page, "set_margin_" + side)(16)
-        scroller.set_child(page)
+    @staticmethod
+    def _note(text):
+        label = Gtk.Label(label=text, xalign=0)
+        label.set_wrap(True)
+        label.set_hexpand(True)
+        label.add_css_class("dim")
+        return label
 
-        page.append(self._build_roles())
-        page.append(self._build_what())
-        page.append(self._build_where())
-        page.append(self._build_verify())
-        page.append(self._build_advanced())
-        page.append(self._build_log())
+    def _build_route(self):
+        """How traffic leaves, and proof that it does."""
+        view, box = self._view()
 
-        outer.append(self._build_actions())
-
-        switcher = Gtk.StackSwitcher()
-        switcher.set_stack(self.stack)
-        header.set_title_widget(switcher)
-        self.on_role_changed()
-
-        self._env_banner()
-        threading.Thread(target=self._scan_worker, daemon=True).start()
-        self.refresh_peers()
-        if autolaunch:
-            GLib.timeout_add(600, self._auto)
-
-    # -- sections -------------------------------------------------------- #
-
-    def _frame(self, title):
-        frame = Gtk.Frame()
-        lbl = Gtk.Label(label=title)
-        lbl.add_css_class("section-title")
-        frame.set_label_widget(lbl)
-        grid = Gtk.Grid(column_spacing=10, row_spacing=8)
-        grid.set_hexpand(True)
-        for side in ("top", "bottom", "start", "end"):
-            getattr(grid, "set_margin_" + side)(12)
-        frame.set_child(grid)
-        return frame, grid
-
-    def _entry(self, grid, row, label, key, placeholder="", width=1):
-        lab = Gtk.Label(label=label, xalign=0)
-        entry = Gtk.Entry()
-        entry.set_hexpand(True)
-        entry.set_text(str(self.cfg[key]))
-        if placeholder:
-            entry.set_placeholder_text(placeholder)
-        grid.attach(lab, 0, row, 1, 1)
-        grid.attach(entry, 1, row, width, 1)
-        setattr(self, "e_" + key, entry)
-        return entry
-
-    def _spin(self, grid, row, label, key, lo, hi):
-        lab = Gtk.Label(label=label, xalign=0)
-        spin = Gtk.SpinButton.new_with_range(lo, hi, 1)
-        spin.set_value(int(self.cfg[key]))
-        spin.set_hexpand(True)
-        grid.attach(lab, 0, row, 1, 1)
-        grid.attach(spin, 1, row, 1, 1)
-        setattr(self, "s_" + key, spin)
-        return spin
-
-    def _switch(self, grid, row, label, key, col=0):
-        lab = Gtk.Label(label=label, xalign=0)
-        sw = Gtk.Switch()
-        sw.set_active(bool(self.cfg[key]))
-        sw.set_halign(Gtk.Align.START)
-        grid.attach(lab, col, row, 1, 1)
-        grid.attach(sw, col + 1, row, 1, 1)
-        setattr(self, "w_" + key, sw)
-        return sw
-
-    def _build_roles(self):
-        """Two modes: this machine is the exit point, or it dials one."""
         self.stack = Gtk.Stack()
         self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
         self.stack.add_titled(self._build_client_page(), "client", "Client")
@@ -2649,12 +3027,25 @@ class Window(Gtk.ApplicationWindow):
         self.stack.set_visible_child_name(
             "host" if self.cfg["role"] == "host" else "client")
         self.stack.connect("notify::visible-child-name", self.on_role_changed)
-        return self.stack
+
+        switcher = Gtk.StackSwitcher()
+        switcher.set_stack(self.stack)
+        switcher.set_halign(Gtk.Align.CENTER)
+        box.append(switcher)
+        box.append(self.stack)
+        box.append(self._build_verify())
+        return view
 
     # -- client side ----------------------------------------------------- #
 
     def _build_client_page(self):
-        frame, grid = self._frame("Pick a host to route through")
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+
+        group = Adw.PreferencesGroup(
+            title="Pick a host to route through",
+            description="Everything Syncplay and mpv fetch will leave from the host you "
+                        "pick here. The tunnel dials outward, so nothing needs "
+                        "forwarding at either end.")
 
         self.peer_list = Gtk.ListBox()
         self.peer_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
@@ -2668,29 +3059,24 @@ class Window(Gtk.ApplicationWindow):
         holder.set_max_content_height(220)
         holder.set_hexpand(True)
         holder.set_child(self.peer_list)
-        grid.attach(holder, 0, 0, 3, 1)
+        group.add(holder)
+        page.append(group)
 
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         refresh = Gtk.Button(label="Refresh list")
         refresh.connect("clicked", lambda _b: self.refresh_peers())
-        grid.attach(refresh, 0, 1, 1, 1)
-
+        buttons.append(refresh)
         keybtn = Gtk.Button(label="Set up SSH key…")
         keybtn.connect("clicked", lambda _b: self.open_key_dialog())
-        grid.attach(keybtn, 1, 1, 1, 1)
+        buttons.append(keybtn)
+        page.append(buttons)
 
-        self._entry(grid, 2, "Host address", "host_ip", "100.x.x.x, or a hostname")
-        self._entry(grid, 3, "SSH user on the host", "host_user", "account name on the exit machine")
-
-        note = Gtk.Label(
-            label="Everything Syncplay and mpv fetch will leave from the host you pick here. "
-                  "The tunnel dials outward, so nothing needs forwarding at either end.",
-            xalign=0)
-        note.set_wrap(True)
-        note.set_hexpand(True)
-        note.set_max_width_chars(60)
-        note.add_css_class("dim")
-        grid.attach(note, 0, 4, 3, 1)
-        return frame
+        fields = Adw.PreferencesGroup()
+        self._entry(fields, "Host address", "host_ip", "100.x.x.x, or a hostname")
+        self._entry(fields, "SSH user on the host", "host_user",
+                    "account name on the exit machine")
+        page.append(fields)
+        return page
 
     def refresh_peers(self):
         threading.Thread(target=self._peers_worker, daemon=True).start()
@@ -2752,58 +3138,56 @@ class Window(Gtk.ApplicationWindow):
     # -- host side ------------------------------------------------------- #
 
     def _build_host_page(self):
-        frame, grid = self._frame("This machine is the exit point")
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
 
-        self.host_self_label = Gtk.Label(label="checking…", xalign=0)
-        self.host_self_label.set_hexpand(True)
-        grid.attach(Gtk.Label(label="Tailscale name", xalign=0), 0, 0, 1, 1)
-        grid.attach(self.host_self_label, 1, 0, 2, 1)
+        group = Adw.PreferencesGroup(
+            title="This machine is the exit point",
+            description="Traffic already leaves from here, so no tunnel is opened in "
+                        "this mode. Start watching launches Syncplay directly.")
 
-        self.host_sshd_label = Gtk.Label(label="checking…", xalign=0)
-        self.host_sshd_label.set_hexpand(True)
-        grid.attach(Gtk.Label(label="SSH server", xalign=0), 0, 1, 1, 1)
-        grid.attach(self.host_sshd_label, 1, 1, 2, 1)
+        # These stay GtkLabels in a suffix rather than becoming row subtitles,
+        # because the workers that fill them call set_text() on each by name.
+        def status_row(title, wrap=False):
+            label = Gtk.Label(label="checking…", xalign=1)
+            label.add_css_class("dim")
+            if wrap:
+                label.set_wrap(True)
+                label.set_max_width_chars(40)
+            row = Adw.ActionRow(title=title)
+            row.add_suffix(label)
+            group.add(row)
+            return label
 
-        self.host_keys_label = Gtk.Label(label="checking…", xalign=0)
-        self.host_keys_label.set_hexpand(True)
-        grid.attach(Gtk.Label(label="Keys installed", xalign=0), 0, 2, 1, 1)
-        grid.attach(self.host_keys_label, 1, 2, 2, 1)
+        self.host_self_label = status_row("Tailscale name")
+        self.host_sshd_label = status_row("SSH server")
+        self.host_keys_label = status_row("Keys installed")
+        self.host_conn_label = status_row("Connected now", wrap=True)
 
-        self.host_conn_label = Gtk.Label(label="checking…", xalign=0)
-        self.host_conn_label.set_hexpand(True)
-        self.host_conn_label.set_wrap(True)
-        self.host_conn_label.set_max_width_chars(50)
-        grid.attach(Gtk.Label(label="Connected now", xalign=0), 0, 3, 1, 1)
-        grid.attach(self.host_conn_label, 1, 3, 2, 1)
-
+        share_row = Adw.ActionRow(title="Give this to the client")
         self.host_share = Gtk.Entry()
         self.host_share.set_editable(False)
         self.host_share.set_hexpand(True)
-        grid.attach(Gtk.Label(label="Give this to the client", xalign=0), 0, 4, 1, 1)
-        grid.attach(self.host_share, 1, 4, 1, 1)
-        copy = Gtk.Button(label="Copy")
+        self.host_share.set_valign(Gtk.Align.CENTER)
+        share_row.add_suffix(self.host_share)
+        copy = Gtk.Button(icon_name="edit-copy-symbolic")
+        copy.set_tooltip_text("Copy")
+        copy.set_valign(Gtk.Align.CENTER)
         copy.connect("clicked", self.on_copy_share)
-        grid.attach(copy, 2, 4, 1, 1)
+        share_row.add_suffix(copy)
+        group.add(share_row)
+        page.append(group)
 
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         recheck = Gtk.Button(label="Re-check")
         recheck.connect("clicked", lambda _b: self.refresh_peers())
-        grid.attach(recheck, 0, 5, 1, 1)
-
+        buttons.append(recheck)
         self.btn_restrict = Gtk.Button(label="Restrict existing keys")
+        self.btn_restrict.add_css_class("destructive-action")
         self.btn_restrict.connect("clicked", self.on_restrict_keys)
         self.btn_restrict.set_visible(False)
-        grid.attach(self.btn_restrict, 1, 5, 2, 1)
-
-        note = Gtk.Label(
-            label="Traffic already leaves from here, so no tunnel is opened in this mode. "
-                  "Start watching launches Syncplay directly.",
-            xalign=0)
-        note.set_wrap(True)
-        note.set_hexpand(True)
-        note.set_max_width_chars(60)
-        note.add_css_class("dim")
-        grid.attach(note, 0, 6, 3, 1)
-        return frame
+        buttons.append(self.btn_restrict)
+        page.append(buttons)
+        return page
 
     def _count_worker(self):
         """Who is on our sshd right now. Runs off the main loop: ss is a fork."""
@@ -2952,9 +3336,11 @@ class Window(Gtk.ApplicationWindow):
         return False
 
     def _build_where(self):
-        frame, grid = self._frame("Where to play")
+        view, box = self._view()
 
         self.runtimes = []
+
+        group = Adw.PreferencesGroup(title="Where to play")
 
         # Same widget as the host picker: a plain ListBox of rows inside a
         # scroller, each row carrying its runtime. Nothing here depends on a
@@ -2967,41 +3353,40 @@ class Window(Gtk.ApplicationWindow):
 
         env_holder = Gtk.ScrolledWindow()
         env_holder.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        env_holder.set_min_content_height(120)
-        env_holder.set_max_content_height(220)
+        env_holder.set_min_content_height(140)
+        env_holder.set_max_content_height(280)
         env_holder.set_hexpand(True)
         env_holder.set_child(self.env_list)
-        grid.attach(env_holder, 0, 0, 3, 1)
+        group.add(env_holder)
+        box.append(group)
         self._set_env_rows([])
 
         self.env_detail = Gtk.Label(label="", xalign=0)
         self.env_detail.set_wrap(True)
         self.env_detail.set_hexpand(True)
-        self.env_detail.set_max_width_chars(56)
-        grid.attach(self.env_detail, 0, 1, 2, 1)
+        box.append(self.env_detail)
 
-        self.btn_install = Gtk.Button(label="Install missing")
-        self.btn_install.connect("clicked", self.on_install_missing)
-        self.btn_install.set_visible(False)
-        grid.attach(self.btn_install, 2, 1, 1, 1)
-
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         rescan = Gtk.Button(label="Rescan")
         rescan.connect("clicked", self.on_rescan)
-        grid.attach(rescan, 0, 2, 1, 1)
+        buttons.append(rescan)
+        self.btn_install = Gtk.Button(label="Install missing")
+        self.btn_install.add_css_class("suggested-action")
+        self.btn_install.connect("clicked", self.on_install_missing)
+        self.btn_install.set_visible(False)
+        buttons.append(self.btn_install)
+        box.append(buttons)
 
-        self._switch(grid, 2, "Start stopped containers while scanning",
-                     "scan_stopped", col=1)
+        options = Adw.PreferencesGroup()
+        self._switch(options, "Start stopped containers while scanning", "scan_stopped",
+                     "A stopped container has to be started before it can be looked "
+                     "inside.")
+        box.append(options)
 
-        self.where_note = Gtk.Label(
-            label="Looking for Syncplay and mpv on this system and in every distrobox…",
-            xalign=0,
-        )
-        self.where_note.set_wrap(True)
-        self.where_note.set_hexpand(True)
-        self.where_note.set_max_width_chars(60)
-        self.where_note.add_css_class("dim")
-        grid.attach(self.where_note, 0, 3, 3, 1)
-        return frame
+        self.where_note = self._note(
+            "Looking for Syncplay and mpv on this system and in every distrobox…")
+        box.append(self.where_note)
+        return view
 
     def _set_env_rows(self, found, placeholder="Scanning…", select=None):
         """Refill the environment list. `select` is an index into `found`."""
@@ -3039,36 +3424,97 @@ class Window(Gtk.ApplicationWindow):
                 chosen = row
         self.env_list.select_row(chosen or self.env_list.get_row_at_index(0))
 
-    def _build_what(self):
-        frame, grid = self._frame("What to play")
+    def _build_watch(self):
+        view, box = self._view()
 
-        self._entry(grid, 0, "URL", "play_url",
-                    "https://…  — leave blank to pick a file in Syncplay yourself",
-                    width=1)
+        self.history_group = Adw.PreferencesGroup(title="Continue watching")
+        browse_btn = Gtk.Button(label="Browse…")
+        browse_btn.add_css_class("suggested-action")
+        browse_btn.connect("clicked", self.on_browse)
+        self.history_group.set_header_suffix(browse_btn)
 
-        browse = Gtk.Button(label="Browse…")
-        browse.connect("clicked", self.on_browse)
-        grid.attach(browse, 2, 0, 1, 1)
+        self.history_list = Gtk.ListBox()
+        self.history_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.history_list.add_css_class("boxed-list")
+        holder = Gtk.ScrolledWindow()
+        holder.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        holder.set_min_content_height(120)
+        holder.set_max_content_height(300)
+        holder.set_child(self.history_list)
+        self.history_group.add(holder)
+        box.append(self.history_group)
+
+        playing = Adw.PreferencesGroup(
+            title="Playing",
+            description="A URL here is handed to Syncplay, which puts it on the shared "
+                        "playlist — so it starts for everyone in the room, whoever set "
+                        "it. It also skips Syncplay's setup dialog, which only stays "
+                        "away while a URL is set.")
+        self._entry(playing, "URL", "play_url",
+                    "https://…  — leave blank to pick a file in Syncplay yourself")
+        box.append(playing)
 
         self.queue_note = Gtk.Label(label="", xalign=0)
         self.queue_note.set_wrap(True)
         self.queue_note.set_hexpand(True)
-        self.queue_note.set_max_width_chars(60)
         self.queue_note.set_visible(False)
-        grid.attach(self.queue_note, 0, 1, 3, 1)
+        box.append(self.queue_note)
+        return view
 
-        note = Gtk.Label(
-            label="A URL here is handed to Syncplay, which puts it on the shared "
-                  "playlist — so it starts for everyone in the room, whoever typed it. "
-                  "It also skips Syncplay's setup dialog, which only stays away while a "
-                  "URL is set. Browse… finds episodes and fills this in for you.",
-            xalign=0)
-        note.set_wrap(True)
-        note.set_hexpand(True)
-        note.set_max_width_chars(60)
-        note.add_css_class("dim")
-        grid.attach(note, 0, 2, 3, 1)
-        return frame
+    def refresh_history(self):
+        """Redraw Continue watching from the store."""
+        if not hasattr(self, "history_list"):
+            return
+        clear_list(self.history_list)
+        entries = self.history.entries()
+        if not entries:
+            row = Gtk.ListBoxRow()
+            row.set_activatable(False)
+            label = self._note("Nothing watched yet. Browse… finds a series and puts "
+                               "its episodes on the shared playlist.")
+            label.set_margin_top(12)
+            label.set_margin_bottom(12)
+            label.set_margin_start(12)
+            label.set_margin_end(12)
+            row.set_child(label)
+            self.history_list.append(row)
+            return
+
+        for entry in entries:
+            season = int(entry.get("season") or 0)
+            episode = int(entry.get("episode") or 0)
+            row = Adw.ActionRow(title=entry.get("name") or entry.get("id"))
+            if season and episode:
+                # The stored episode is the last one queued, so the interesting
+                # one is the next.
+                row.set_subtitle("watched S%02dE%02d  ·  next S%02dE%02d"
+                                 % (season, episode, season, episode + 1))
+            resume = Gtk.Button(label="Resume")
+            resume.set_valign(Gtk.Align.CENTER)
+            resume.connect("clicked", self.on_resume_entry, entry)
+            row.add_suffix(resume)
+            forget = Gtk.Button(icon_name="user-trash-symbolic")
+            forget.set_tooltip_text("Remove from this list")
+            forget.set_valign(Gtk.Align.CENTER)
+            forget.add_css_class("flat")
+            forget.connect("clicked", self.on_forget_entry, entry)
+            row.add_suffix(forget)
+            row.set_activatable_widget(resume)
+            self.history_list.append(row)
+
+    def on_resume_entry(self, _btn, entry):
+        self.collect()
+        win = BrowseWindow(self)
+        win.present()
+        win.open_series(Series(entry.get("id", ""), entry.get("name") or "",
+                               entry.get("year") or ""),
+                        season=int(entry.get("season") or 0),
+                        after=int(entry.get("episode") or 0))
+
+    def on_forget_entry(self, _btn, entry):
+        self.history.forget(entry.get("id", ""))
+        self.refresh_history()
+        self.toast("Removed %s" % (entry.get("name") or "series"))
 
     def on_browse(self, _btn):
         self.collect()
@@ -3204,76 +3650,147 @@ class Window(Gtk.ApplicationWindow):
         threading.Thread(target=work, daemon=True).start()
 
     def _build_verify(self):
-        frame, grid = self._frame("Route check")
+        group = Adw.PreferencesGroup(title="Route check")
 
         btn = Gtk.Button(label="Check the route")
         btn.add_css_class("suggested-action")
         btn.connect("clicked", self.on_test)
         self.btn_test = btn
-        grid.attach(btn, 0, 0, 3, 1)
+        group.set_header_suffix(btn)
 
         self.results = Gtk.ListBox()
         self.results.set_selection_mode(Gtk.SelectionMode.NONE)
         self.results.add_css_class("boxed-list")
         self.results.set_hexpand(True)
-        grid.attach(self.results, 0, 1, 3, 1)
+        group.add(self.results)
 
         self.verdict = Gtk.Label(label="Not checked yet.", xalign=0)
         self.verdict.set_wrap(True)
         self.verdict.set_hexpand(True)
-        self.verdict.set_max_width_chars(60)
-        grid.attach(self.verdict, 0, 2, 3, 1)
-        self.frame_verify = frame
-        return frame
+        self.verdict.set_margin_top(10)
+        group.add(self.verdict)
+        # Kept under the old name: on_role_changed hides the whole thing in host
+        # mode, where there is nothing to route through.
+        self.frame_verify = group
+        return group
 
-    def _build_advanced(self):
-        exp = Gtk.Expander(label="Advanced")
-        frame, grid = self._frame("")
-        frame.set_label_widget(None)
+    def _build_setup(self):
+        page = Adw.PreferencesPage()
 
-        self._spin(grid, 0, "SOCKS5 port", "socks_port", 1, 65535)
-        self._spin(grid, 1, "HTTP bridge port", "http_port", 1, 65535)
-        self._spin(grid, 2, "SSH port", "host_ssh_port", 1, 65535)
-        self._spin(grid, 3, "Watchdog interval (s)", "check_interval", 3, 300)
-        self._spin(grid, 4, "Failures before stopping", "max_fails", 1, 20)
-        self._entry(grid, 5, "Syncplay server", "syncplay_server", "syncplay.pl:8997")
-        self._entry(grid, 6, "Room", "syncplay_room", "")
-        self._entry(grid, 7, "Display name", "syncplay_user", "")
-        self._entry(grid, 8, "Extra mpv flags", "mpv_extra", "--cache=yes --demuxer-max-bytes=200M")
-        key = self._entry(grid, 9, "Real-Debrid API key", "rd_api_key",
-                          "from real-debrid.com/apitoken")
-        # It is a password in every way that matters, so it is not left on screen.
-        key.set_visibility(False)
-        self._entry(grid, 10, "Torrentio options", "torrentio_opts", "sort=qualitysize")
-        self._entry(grid, 11, "Preferred quality", "preferred_quality", "1080p")
-        self._switch(grid, 12, "Require a verified route before launching", "require_verified")
-        self._switch(grid, 13, "Stop the container when the tunnel drops", "stop_container_on_drop")
-        self._switch(grid, 14, "Skip Syncplay's setup dialog", "skip_syncplay_dialog")
-        self._switch(grid, 15, "Trust the domain of the URL being played", "trust_play_domain")
+        conn = Adw.PreferencesGroup(
+            title="Connection",
+            description="Ports used on this machine only. Change them if something "
+                        "else already listens there.")
+        self._spin(conn, "SOCKS5 port", "socks_port", 1, 65535,
+                   "Used by yt-dlp and ALL_PROXY.")
+        self._spin(conn, "HTTP bridge port", "http_port", 1, 65535,
+                   "Used by mpv and FFmpeg, which only speak HTTP CONNECT.")
+        self._spin(conn, "SSH port", "host_ssh_port", 1, 65535,
+                   "The port sshd listens on at the other end.")
+        page.add(conn)
 
-        note = Gtk.Label(
-            label="The Real-Debrid key is stored in config.json, which is written "
-                  "owner-only. It grants full access to that account.",
-            xalign=0)
-        note.set_wrap(True)
-        note.set_max_width_chars(64)
-        note.add_css_class("dim")
-        grid.attach(note, 0, 16, 2, 1)
+        sync = Adw.PreferencesGroup(
+            title="Syncplay",
+            description="Leave blank to use Syncplay's own saved settings. The server "
+                        "and room are required to queue more than one episode.")
+        self._entry(sync, "Server", "syncplay_server", "syncplay.pl:8997")
+        self._entry(sync, "Room", "syncplay_room", "the room you both join")
+        self._entry(sync, "Display name", "syncplay_user", "the name the other side sees")
+        page.add(sync)
 
-        exp.set_child(frame)
-        return exp
+        lib = Adw.PreferencesGroup(
+            title="Library",
+            description="The Real-Debrid key is stored in config.json, which is written "
+                        "owner-only, and it grants full access to that account. It is "
+                        "kept out of the activity log.")
+        self._entry(lib, "Real-Debrid API key", "rd_api_key",
+                    "from real-debrid.com/apitoken", password=True)
+        self._entry(lib, "Torrentio options", "torrentio_opts",
+                    "pipe-joined, e.g. sort=qualitysize|qualityfilter=cam,scr")
+        self._entry(lib, "Preferred quality", "preferred_quality",
+                    "matched exactly first, e.g. 1080p")
+        page.add(lib)
+
+        play = Adw.PreferencesGroup(title="Playback")
+        self._entry(play, "Extra mpv flags", "mpv_extra",
+                    "--cache=yes --demuxer-max-bytes=200M")
+        self._switch(play, "Skip Syncplay's setup dialog", "skip_syncplay_dialog",
+                     "Writes forceguiprompt = False into Syncplay's own config. Only "
+                     "takes effect while a URL is set.")
+        self._switch(play, "Trust the domain of what is played", "trust_play_domain",
+                     "Adds each hostname to Syncplay's trusted domains, so switching "
+                     "episode never stops for a confirmation.")
+        page.add(play)
+
+        safety = Adw.PreferencesGroup(
+            title="Safety",
+            description="What happens when the route cannot be trusted.")
+        self._switch(safety, "Require a verified route before launching",
+                     "require_verified",
+                     "Leave this on. It is what stops playback going out from this "
+                     "machine, and it also gates resolving debrid links.")
+        self._switch(safety, "Stop the container when the tunnel drops",
+                     "stop_container_on_drop",
+                     "Shuts the distrobox down too, so nothing is left running.")
+        self._spin(safety, "Watchdog interval", "check_interval", 3, 300,
+                   "Seconds between tests that traffic still goes through the tunnel.")
+        self._spin(safety, "Failures before stopping", "max_fails", 1, 20,
+                   "Consecutive failures tolerated before everything is killed.")
+        page.add(safety)
+
+        upkeep = Adw.PreferencesGroup(
+            title="Stored data",
+            description="Everything lives in %s." % DATA_DIR)
+        self.cache_row = Adw.ActionRow(title="Cached lookups")
+        clear_cache = Gtk.Button(label="Clear")
+        clear_cache.set_valign(Gtk.Align.CENTER)
+        clear_cache.connect("clicked", self.on_clear_cache)
+        self.cache_row.add_suffix(clear_cache)
+        upkeep.add(self.cache_row)
+
+        self.history_row = Adw.ActionRow(title="Watch history")
+        clear_hist = Gtk.Button(label="Clear")
+        clear_hist.set_valign(Gtk.Align.CENTER)
+        clear_hist.add_css_class("destructive-action")
+        clear_hist.connect("clicked", self.on_clear_history)
+        self.history_row.add_suffix(clear_hist)
+        upkeep.add(self.history_row)
+        page.add(upkeep)
+
+        self._refresh_upkeep()
+        return page
+
+    def _refresh_upkeep(self):
+        if not hasattr(self, "cache_row"):
+            return
+        entries = self.cache.count()
+        self.cache_row.set_subtitle(
+            "%d saved answer%s — searches for a week, episode lists for a day, "
+            "sources for six hours" % (entries, "" if entries == 1 else "s"))
+        seen = len(self.history.entries())
+        self.history_row.set_subtitle(
+            "%d series remembered" % seen if seen else "nothing remembered yet")
+
+    def on_clear_cache(self, _btn):
+        self.cache.clear()
+        self._refresh_upkeep()
+        self.toast("Cached lookups cleared")
+
+    def on_clear_history(self, _btn):
+        self.history.clear()
+        self.refresh_history()
+        self._refresh_upkeep()
+        self.toast("Watch history cleared")
 
     def _build_log(self):
-        frame, grid = self._frame("Activity")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
 
         sw = Gtk.ScrolledWindow()
-        # Horizontal NEVER is what forces the view to take the frame's width and
-        # wrap into it. With AUTOMATIC the scroller collapses to its minimum.
+        # Horizontal NEVER is what forces the view to take the width available
+        # and wrap into it. With AUTOMATIC the scroller collapses to its minimum.
         sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        sw.set_min_content_height(180)
-        sw.set_min_content_width(360)
         sw.set_hexpand(True)
-        sw.set_vexpand(False)
+        sw.set_vexpand(True)
 
         self.logview = Gtk.TextView()
         self.logview.set_editable(False)
@@ -3281,24 +3798,47 @@ class Window(Gtk.ApplicationWindow):
         self.logview.set_monospace(True)
         self.logview.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self.logview.set_hexpand(True)
-        self.logview.set_left_margin(8)
-        self.logview.set_right_margin(8)
-        self.logview.set_top_margin(6)
-        self.logview.set_bottom_margin(6)
+        self.logview.set_left_margin(12)
+        self.logview.set_right_margin(12)
+        self.logview.set_top_margin(10)
+        self.logview.set_bottom_margin(10)
         self.logbuf = self.logview.get_buffer()
 
         sw.set_child(self.logview)
-        grid.attach(sw, 0, 0, 1, 1)
-        return frame
+        box.append(sw)
+
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(bar, "set_margin_" + side)(12)
+        hint = self._note("Also written to %s" % LOG_FILE)
+        hint.set_hexpand(True)
+        bar.append(hint)
+        copy = Gtk.Button(label="Copy")
+        copy.connect("clicked", self.on_copy_log)
+        bar.append(copy)
+        clear = Gtk.Button(label="Clear")
+        clear.connect("clicked", self.on_clear_log)
+        bar.append(clear)
+        box.append(bar)
+        return box
+
+    def on_copy_log(self, btn):
+        start, end = self.logbuf.get_bounds()
+        text = self.logbuf.get_text(start, end, False)
+        try:
+            btn.get_clipboard().set(text)
+            self.toast("Activity log copied")
+        except Exception:
+            self.toast("Could not reach the clipboard")
+
+    def on_clear_log(self, _btn):
+        self.logbuf.set_text("")
+        self.toast("Cleared on screen — %s still has the full record" % LOG_FILE.name)
 
     def _build_actions(self):
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         for side in ("top", "bottom", "start", "end"):
             getattr(bar, "set_margin_" + side)(12)
-
-        save = Gtk.Button(label="Save settings")
-        save.connect("clicked", self.on_save)
-        bar.append(save)
 
         spacer = Gtk.Box()
         spacer.set_hexpand(True)
@@ -3330,6 +3870,21 @@ class Window(Gtk.ApplicationWindow):
         if in_container() and not which("distrobox-host-exec"):
             self.log("distrobox-host-exec is missing, so other containers can't be listed "
                      "from in here.")
+
+    def _seed_history(self):
+        """Carry the old single-slot bookmark into the history list once.
+
+        Before there was a history there was one remembered series. Somebody
+        upgrading should still see it under Continue watching rather than an
+        empty panel.
+        """
+        if self.history.entries():
+            return
+        sid = str(self.cfg["library_series_id"] or "").strip()
+        if not sid:
+            return
+        self.history.remember(sid, str(self.cfg["library_series_name"] or sid), "",
+                              self.cfg["library_season"], self.cfg["library_episode"])
 
     def collect(self):
         for key in DEFAULTS:
@@ -3516,7 +4071,8 @@ class Window(Gtk.ApplicationWindow):
         dlg.present()
         return False
 
-    def on_save(self, _btn):
+    def on_save(self, _btn=None):
+        """Kept for the explicit path; editing a setting also saves on its own."""
         self.collect()
         try:
             self.cfg.save()
@@ -3761,7 +4317,7 @@ class Window(Gtk.ApplicationWindow):
         return False
 
 
-class App(Gtk.Application):
+class App(Adw.Application):
     def __init__(self, autolaunch=False):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.NON_UNIQUE)
         self.autolaunch = autolaunch

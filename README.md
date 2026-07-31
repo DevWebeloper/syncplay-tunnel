@@ -18,6 +18,10 @@ Syncplay does not have to live in a container. The app scans this system and
 every distrobox you have, reports which ones actually have Syncplay and mpv, and
 lists the complete ones first.
 
+It also finds what to watch: search a series, pick episodes, and it resolves them
+through the tunnel onto Syncplay's shared playlist, so neither of you copies a
+link again.
+
 ---
 
 ## The leak this fixes
@@ -66,7 +70,7 @@ before launching** on (default), the launch button stays blocked until it passes
 
 ## Two modes
 
-A switcher in the title bar picks which end of the link this machine is.
+A switcher at the top of **Route** picks which end of the link this machine is.
 
 **Client** — the machine that needs its traffic to come out somewhere else. It
 lists every Tailscale peer with hostname, address, OS and online state, online
@@ -311,6 +315,32 @@ log file: anything that might carry one of those URLs is redacted first.
 
 ---
 
+## Remembering things
+
+Two files sit next to the log in `~/.local/share/syncplay-tunnel/`, both written
+owner-only.
+
+**`cache.json`** keeps what Cinemeta and Torrentio answered, so re-opening a
+series you looked at a minute ago is instant instead of another round trip.
+Searches are kept for a week, episode lists for a day, and source lists for six
+hours — shortest, because what the debrid server already holds changes, and new
+releases appear. The Refresh button beside the search box ignores all of it and
+asks again, so a stale list is never a dead end.
+
+Resolved debrid links are **not** cached. They expire, and a stale one fails in
+the middle of an episode.
+
+The Real-Debrid key travels inside Torrentio's URL, so a cached source list would
+otherwise write it to disk. Stored entries keep the key replaced by a
+placeholder and it is put back on the way out — the file never contains it.
+
+**`history.json`** is the last 30 series, most recent first. Each one appears
+under *Continue watching* with the episode you reached and a **Resume** button
+that opens the browser at the next one. Both files can be emptied from **Setup ▸
+Stored data**, which also shows how much is in them.
+
+---
+
 ## Install
 
 ### Recommended: native (all three targets have GTK4 already)
@@ -338,8 +368,8 @@ launcher shows up in the host's app menu.
 
 | System | Command |
 |---|---|
-| CachyOS / Arch | `sudo pacman -S --needed python-gobject gtk4 openssh curl` |
-| Ubuntu / Debian container | `sudo apt install -y python3-gi gir1.2-gtk-4.0 libgtk-4-1 openssh-client curl` |
+| CachyOS / Arch | `sudo pacman -S --needed python-gobject gtk4 libadwaita openssh curl` |
+| Ubuntu / Debian container | `sudo apt install -y python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 libgtk-4-1 openssh-client curl` |
 | Fedora Silverblue | already present in the base image |
 
 ### AppImage
@@ -381,20 +411,27 @@ On the **host machine**: sshd running, Tailscale up. Nothing else.
 
 ## Using it
 
-1. **Pick your mode** in the title bar, then choose a host from the peer list
-   (Client) or check the reported details (Host).
-2. **What to play** — optional. A URL here starts for both of you and skips
-   Syncplay's setup dialog. **Browse…** finds episodes and fills it in for you;
-   run *Check the route* first, since links are resolved through the tunnel.
-3. **Where to play** — pick the system or container from the list. *Rescan*
-   re-checks, and *Install* fills in whatever is missing there.
-4. **Check the route** — watch the seven rows. Client mode only; the host
-   has nothing to route through.
-5. **Save settings** — written to `~/.config/syncplay-tunnel/config.json`, mode
-   `600`. Because distrobox shares `$HOME`, the container and the Silverblue host
-   read the same file automatically.
-6. **Start watching** — writes the mpv wrapper, opens the tunnel, starts the
+The window has a sidebar with five places to be. **Start watching** and
+**Stop session** sit under all of them, because they are the point.
+
+1. **Route** — pick Client or Host at the top. As a client, choose a host from
+   the Tailscale list; as a host, check the reported details. Then **Check the
+   route** and watch the seven rows. Client mode only; a host has nothing to
+   route through.
+2. **Where** — pick the system or container to launch from. *Rescan* re-checks,
+   and *Install missing* fills in whatever that environment lacks.
+3. **Setup** — the Real-Debrid key, Syncplay server and room, ports, and the
+   safety switches. **Settings save themselves** a moment after you change them,
+   to `~/.config/syncplay-tunnel/config.json`, mode `600`. Because distrobox
+   shares `$HOME`, the container and the host read the same file.
+4. **Watch** — *Continue watching* lists what you have been through, each with
+   **Resume**, which opens the browser at the next episode. **Browse…** finds
+   something new. Run *Check the route* first: links are resolved through the
+   tunnel.
+5. **Start watching** — writes the mpv wrapper, opens the tunnel, starts the
    watchdog, launches Syncplay.
+
+**Activity** holds the running log, with Copy and Clear.
 
 Quick launch: the desktop entry has a **Check route and start watching** action
 (right-click the icon), or `syncplay-tunnel --launch`. It runs the check and
@@ -402,16 +439,16 @@ only launches if it passes.
 
 ---
 
-## Advanced settings
+## Setup
 
 | Setting | Default | Notes |
 |---|---|---|
 | SOCKS5 port | 8080 | Used by yt-dlp and `ALL_PROXY`. |
 | HTTP bridge port | 8118 | Used by mpv/FFmpeg and `http_proxy`. |
-| Start stopped containers | off | Scanning a stopped container requires starting it. |
-| Watchdog interval | 10 s | How often the tunnel is tested. |
+| Start stopped containers | off | Scanning a stopped container requires starting it. Lives on **Where**. |
 | Failures before stopping | 3 | Consecutive failures before everything is killed. |
 | Extra mpv flags | — | Appended to the wrapper, e.g. `--cache=yes --demuxer-max-bytes=200M`. |
+| Watchdog interval | 10 s | How often the tunnel is tested. |
 | Real-Debrid API key | — | From [real-debrid.com/apitoken](https://real-debrid.com/apitoken). Needed by **Browse…**; kept out of every log. |
 | Torrentio options | `sort=qualitysize` | Pipe-joined, e.g. `sort=seeders\|qualityfilter=480p,scr,cam`. A `realdebrid=` here is replaced by the key above. |
 | Preferred quality | `1080p` | Matched exactly first, so it won't settle for `1080p 3D SBS` while a plain 1080p release exists. |

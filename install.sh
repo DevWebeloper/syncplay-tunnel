@@ -35,19 +35,20 @@ say "Detected: $FAMILY (in container: $IN_CONTAINER)"
 # the "Where to play" section, where it knows which environment you picked.
 check_deps() {
     missing=()
-    python3 - <<'PY' 2>/dev/null || missing+=("python3-gobject + gtk4")
+    python3 - <<'PY' 2>/dev/null || missing+=("python3-gobject + gtk4 + libadwaita")
 import gi
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gtk
+gi.require_version("Adw", "1")
+from gi.repository import Gtk, Adw
 PY
     for t in ssh curl; do command -v "$t" >/dev/null 2>&1 || missing+=("$t"); done
 }
 
 install_cmd() {
     case "$FAMILY" in
-        arch)   echo "pacman -S --needed --noconfirm python-gobject gtk4 openssh curl" ;;
-        debian) echo "apt-get update && apt-get install -y python3-gi gir1.2-gtk-4.0 libgtk-4-1 openssh-client curl" ;;
-        fedora) echo "dnf install -y python3-gobject gtk4 openssh-clients curl" ;;
+        arch)   echo "pacman -S --needed --noconfirm python-gobject gtk4 libadwaita openssh curl" ;;
+        debian) echo "apt-get update && apt-get install -y python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 libgtk-4-1 openssh-client curl" ;;
+        fedora) echo "dnf install -y python3-gobject gtk4 libadwaita openssh-clients curl" ;;
         *)      echo "" ;;
     esac
 }
@@ -59,9 +60,9 @@ if [ ${#missing[@]} -gt 0 ]; then
 
     if [ "$FAMILY" = silverblue ]; then
         # Layering needs a reboot, so don't do it behind the user's back.
-        echo "    Silverblue ships python3-gobject and gtk4 already. If this check"
-        echo "    still failed, either run the app inside your container, or layer it:"
-        echo "        sudo rpm-ostree install python3-gobject gtk4   # then reboot"
+        echo "    Silverblue ships python3-gobject, gtk4 and libadwaita already. If this"
+        echo "    check still failed, either run the app inside your container, or layer it:"
+        echo "        sudo rpm-ostree install python3-gobject gtk4 libadwaita   # then reboot"
     elif [ -n "$cmd" ]; then
         echo "    sudo sh -c '$cmd'"
         read -rp "Install them now with sudo? [y/N] " ans
