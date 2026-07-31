@@ -90,7 +90,24 @@ fi
 
 # --- install ---------------------------------------------------------------
 mkdir -p "$BIN_DIR" "$APP_DIR" "$ICON_DIR"
-install -m 755 "$SRC_DIR/syncplay-tunnel.py" "$BIN_DIR/syncplay-tunnel"
+
+# The application is a package now, so it goes to its own directory under
+# ~/.local/share and the launcher on PATH points at that rather than carrying
+# the code itself.
+PKG_DIR="$HOME/.local/share/syncplay-tunnel-app"
+rm -rf "$PKG_DIR"
+mkdir -p "$PKG_DIR"
+cp -r "$SRC_DIR/syncplay_tunnel" "$PKG_DIR/"
+find "$PKG_DIR" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+cat > "$BIN_DIR/syncplay-tunnel" <<LAUNCHER
+#!/usr/bin/env python3
+"""Launcher written by install.sh; the application lives in $PKG_DIR."""
+import sys
+sys.path.insert(0, "$PKG_DIR")
+from syncplay_tunnel.ui.app import main
+main()
+LAUNCHER
+chmod 755 "$BIN_DIR/syncplay-tunnel"
 install -m 644 "$SRC_DIR/syncplay-tunnel.svg" "$ICON_DIR/syncplay-tunnel.svg"
 
 sed "s|^Exec=syncplay-tunnel|Exec=$BIN_DIR/syncplay-tunnel|" \

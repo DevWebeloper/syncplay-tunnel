@@ -364,6 +364,18 @@ Stored data**, which also shows how much is in them.
 
 ---
 
+## Layout
+
+The app is a package under `syncplay_tunnel/`, split by concern —
+`library.py` for the addons and the debrid account, `session.py` for the tunnel,
+`ui/` for the interface, and so on. **`INDEX.md` lists what lives where**, so a
+change can go to the right file without reading everything.
+
+Still no pip dependencies: PyGObject with GTK4 and libadwaita, plus `ssh` and
+`curl`.
+
+---
+
 ## Install
 
 ### Recommended: native (all three targets have GTK4 already)

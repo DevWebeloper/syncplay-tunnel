@@ -1009,3 +1009,69 @@ appeared nowhere in the resulting URL.
 started saving themselves (§18.3), switching role and closing the app lost the
 choice. `on_role_changed` now schedules the same debounced save. Asserted by
 writing, reloading `Config()`, and reading the role back.
+
+---
+
+## 19. Split into a package
+
+One 4,700-line file became `syncplay_tunnel/`, so a change can be made without
+reading the whole thing. `INDEX.md` lists every module with its purpose and its
+symbols, and is the thing to read first.
+
+| Module | Holds |
+|---|---|
+| `constants.py` | every fixed value; imports nothing from the package |
+| `util.py` | `run`, the curl fetchers, ports, `redact` |
+| `store.py` | `Config`, `JsonStore`, `Cache`, `History` |
+| `tailscale.py`, `sshkeys.py` | peers; key enrolment and restriction |
+| `runtimes.py` | environments and the per-environment installer |
+| `syncplay_ini.py` | Syncplay's own config file |
+| `library.py` | Cinemeta, Torrentio, the debrid account |
+| `playlist.py` | `SyncplayPush` |
+| `proxy.py`, `session.py` | the CONNECT bridge; the tunnel and watchdog |
+| `ui/widgets.py`, `ui/browse.py`, `ui/window.py`, `ui/app.py` | the interface |
+
+`__init__.py` re-exports everything, so `import syncplay_tunnel as st` still
+gives one flat namespace.
+
+**Three traps, all hit and all fixed:**
+
+- `gi.require_version` has to run before the first `from gi.repository import`.
+  The old header did that; the slices did not, and the app exited immediately
+  with a `PyGIWarning`. `gtk_setup.py` now owns it and is imported first by
+  everything that touches GTK.
+- A lazy `__getattr__` on the package to defer the GTK imports recursed to death.
+  Replaced with direct imports — importing GTK needs no display, only using it
+  does.
+- **Modules import names directly, so patching the package no longer reaches
+  them.** `st.run = fake` used to redirect every caller; now `runtimes.py` holds
+  its own reference. Tests patch at the binding site instead. For the same
+  reason `Config` gained a `path` argument rather than relying on a patchable
+  `CONFIG_FILE` global.
+
+A static pass for names used but never defined or imported caught seven modules
+with missing imports before anything was run — worth repeating after any further
+moves.
+
+`install.sh` now copies the package to `~/.local/share/syncplay-tunnel-app` and
+writes a launcher onto `PATH` that points at it.
+
+### 19.1 Episodes are a checklist
+
+The episode list was `SelectionMode.MULTIPLE`, which needed ctrl-click to add a
+second episode. It is now `SelectionMode.NONE` with a real `Gtk.CheckButton` per
+row: click anywhere on a row to tick it, click again to untick. `checked_rows()`
+replaces `get_selected_rows()` as what the queue is built from.
+
+### 19.2 The setup dialog with no URL
+
+Asked for: skip Syncplay's setup dialog even when no URL is set.
+
+`ConfigurationGetter.py:565` is `(forceGuiPrompt == "True" or not file) and not
+noGui`. The flag half is already handled; the **no file** half cannot be turned
+off except with `--no-gui`, and `clientManager.py:12` shows that drops Syncplay
+to a console interface with no playlist at all — useless here.
+
+So the nearest thing that keeps the GUI: `last_play_url` remembers whatever was
+launched, and a blank URL falls back to it. With nothing remembered the dialog is
+unavoidable, and the log says so plainly rather than pretending.
