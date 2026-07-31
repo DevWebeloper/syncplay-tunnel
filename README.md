@@ -277,8 +277,16 @@ it gives up, so one bad moment does not end a whole queue, and the log names the
 status rather than blaming the JSON. A `404` is not retried — that one means what
 it says.
 
-If everything fails at once, the service is down; the Refresh button and a few
-minutes are the fix.
+If everything fails at once, the service is down — and the app then asks your
+debrid account directly. Anything you have already watched or already have a
+torrent for is still reachable without a torrent index at all: matching files in
+your downloads are offered as-is, and a matching file inside a torrent you
+already hold is unrestricted on the spot. Those come back marked *already on
+Real-Debrid* and skip resolving entirely, because they are final links.
+
+Matching is loose on the release name and strict on the numbering — `S04E01` or
+`4x01`, with the series name having to appear — so the right episode plays or
+none does.
 
 ### One link, one address
 
@@ -288,6 +296,10 @@ through your own tunnels to the same exit, so the debrid account sees one link
 being fetched from one address. Resolving separately on each machine would defeat
 that, which is why the app refuses to resolve at all while the tunnel is down and
 **Require a verified route** is on.
+
+In **Host** mode there is no tunnel and none is wanted: that machine already *is*
+the exit point, so links are resolved straight from it. Either of you can fill
+the playlist, whichever end you are.
 
 Resolution is not instant — Torrentio has to get a link back from the debrid
 service, which measured anywhere from a couple of seconds to about ninety even

@@ -33,6 +33,7 @@ from gi.repository import Gtk, Gdk, GLib, Gio  # noqa: E402
 
 import ast
 import configparser
+import contextlib
 import copy
 import ipaddress
 import json
@@ -48,6 +49,7 @@ import socketserver
 import ssl
 import struct
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -99,6 +101,7 @@ IP_ECHOS = [
 # it takes the debrid key inside its URL path — which is why nothing from these
 # URLs is ever logged raw.
 CINEMETA = "https://v3-cinemeta.strem.io"
+RD_API = "https://api.real-debrid.com/rest/1.0"
 TORRENTIO = "https://torrentio.strem.fun"
 
 # syncplay/utils.py playlistIsValid() rejects anything past these, silently, on
@@ -1322,7 +1325,7 @@ class Source:
     """One Torrentio result, parsed out of its two display strings."""
 
     def __init__(self, quality="", size="", seeders=0, provider="",
-                 filename="", cached=None, url="", infohash=""):
+                 filename="", cached=None, url="", infohash="", direct=False):
         self.quality = quality
         self.size = size
         self.seeders = seeders
@@ -1333,6 +1336,9 @@ class Source:
         self.cached = cached
         self.url = url
         self.infohash = infohash
+        # True when url is already the final link and needs no resolving --
+        # what the debrid account hands back directly.
+        self.direct = direct
 
     def state_text(self):
         if self.cached is True:
@@ -1359,7 +1365,8 @@ class Source:
             url = url.replace(key, KEY_TOKEN)
         return {"quality": self.quality, "size": self.size, "seeders": self.seeders,
                 "provider": self.provider, "filename": self.filename,
-                "cached": self.cached, "url": url, "infohash": self.infohash}
+                "cached": self.cached, "url": url, "infohash": self.infohash,
+                "direct": self.direct}
 
     @staticmethod
     def from_dict(d, key=""):
@@ -1369,7 +1376,8 @@ class Source:
         return Source(quality=d.get("quality", ""), size=d.get("size", ""),
                       seeders=int(d.get("seeders", 0)), provider=d.get("provider", ""),
                       filename=d.get("filename", ""), cached=d.get("cached"),
-                      url=url, infohash=d.get("infohash", ""))
+                      url=url, infohash=d.get("infohash", ""),
+                      direct=bool(d.get("direct")))
 
 
 _SEEDERS_RE = re.compile(r"👤\s*(\d+)")
@@ -1419,6 +1427,189 @@ def parse_source(raw):
         url=raw.get("url") or "",
         infohash=raw.get("infoHash") or "",
     )
+
+
+@contextlib.contextmanager
+def rd_auth_file(key):
+    """A 0600 curl config carrying the debrid token.
+
+    The token goes in a file rather than a -H argument because a command line is
+    readable by every other process on the machine through ps.
+    """
+    fd, path = tempfile.mkstemp(prefix="syncplay-tunnel-", suffix=".conf")
+    os.close(fd)
+    try:
+        os.chmod(path, 0o600)
+        Path(path).write_text('header = "Authorization: Bearer %s"\n' % key)
+        yield path
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def rd_call(cfg, path, socks_port=None, post=None, timeout=30):
+    """One Real-Debrid API call. Returns (data, error)."""
+    key = str(cfg["rd_api_key"] or "").strip()
+    if not key:
+        return None, "no Real-Debrid key set"
+    with rd_auth_file(key) as auth:
+        cmd = ["curl", "-s", "-L", "--max-time", str(timeout), "-K", auth,
+               "-w", "\n%{http_code}"]
+        if socks_port:
+            cmd += ["--socks5-hostname", "127.0.0.1:%d" % socks_port]
+        else:
+            cmd += ["--noproxy", "*"]
+        for field, value in (post or {}).items():
+            cmd += ["--data-urlencode", "%s=%s" % (field, value)]
+        rc, out, err = run(cmd + [RD_API + path], timeout=timeout + 5,
+                           env=_scrubbed_env())
+    if rc != 0:
+        return None, err or "curl exited %s" % rc
+    body, _, code = out.rpartition("\n")
+    code = code.strip()
+    if code == "401":
+        return None, "Real-Debrid rejected the key"
+    if code.isdigit() and not code.startswith("2"):
+        return None, "HTTP %s" % code
+    if not body.strip():
+        return None, "empty reply"
+    try:
+        return json.loads(body), ""
+    except ValueError:
+        return None, "Real-Debrid did not answer with JSON"
+
+
+_EPISODE_PATTERNS = (
+    re.compile(r"[sS](\d{1,3})[\s._-]*[eE](\d{1,3})"),
+    re.compile(r"(?<!\d)(\d{1,2})[xX](\d{2})(?!\d)"),
+)
+
+
+def _words(text):
+    return [w for w in re.split(r"[^0-9a-z]+", (text or "").lower()) if w]
+
+
+def file_is_episode(filename, season, number, series_name=""):
+    """True when a filename looks like this exact episode of this series.
+
+    Deliberately loose on the name and strict on the numbering: release names
+    vary wildly, but SxxEyy is near-universal and is what actually decides
+    whether the right thing plays.
+    """
+    if not filename:
+        return False
+    hit = False
+    for pattern in _EPISODE_PATTERNS:
+        for found in pattern.finditer(filename):
+            if int(found.group(1)) == int(season) and int(found.group(2)) == int(number):
+                hit = True
+                break
+        if hit:
+            break
+    if not hit:
+        return False
+    if not series_name:
+        return True
+    have = set(_words(filename))
+    # Ignore a year in the title: releases put their own year in, and it is
+    # often a different one.
+    want = [w for w in _words(series_name) if not (len(w) == 4 and w.isdigit())]
+    return all(w in have for w in want) if want else True
+
+
+def rd_fallback_sources(cfg, episode, series_name="", socks_port=None, log=None):
+    """Episodes already sitting in the debrid account. Returns (sources, error).
+
+    Used when the source addon cannot be reached. If the file is already on the
+    account there is no need for a torrent index at all.
+    """
+    def say(msg):
+        if log:
+            log(msg)
+
+    found = []
+    downloads, err = rd_call(cfg, "/downloads?limit=200", socks_port=socks_port)
+    if downloads is None:
+        return [], err
+    for item in downloads if isinstance(downloads, list) else []:
+        name = item.get("filename") or ""
+        if not item.get("download"):
+            continue
+        if file_is_episode(name, episode.season, episode.number, series_name):
+            found.append(Source(
+                quality=guess_quality(name),
+                size=human_size(item.get("filesize")),
+                provider="already on Real-Debrid",
+                filename=name, cached=True, url=item["download"], direct=True))
+    if found:
+        say("Found %d copy of %s already on the debrid account."
+            % (len(found), episode.code()) if len(found) == 1 else
+            "Found %d copies of %s already on the debrid account."
+            % (len(found), episode.code()))
+        return found, ""
+
+    # Nothing unrestricted yet, but the torrent may still be there.
+    torrents, err = rd_call(cfg, "/torrents?limit=200", socks_port=socks_port)
+    if torrents is None:
+        return [], err
+    for torrent in torrents if isinstance(torrents, list) else []:
+        if torrent.get("status") != "downloaded":
+            continue
+        title = torrent.get("filename") or ""
+        # A season pack will not name the episode, so look inside anything whose
+        # title matches the series at all.
+        words = [w for w in _words(series_name) if not (len(w) == 4 and w.isdigit())]
+        if series_name and not all(w in set(_words(title)) for w in words):
+            continue
+        info, ierr = rd_call(cfg, "/torrents/info/%s" % torrent.get("id"),
+                             socks_port=socks_port)
+        if info is None:
+            continue
+        selected = [f for f in (info.get("files") or []) if f.get("selected")]
+        links = info.get("links") or []
+        for index, entry in enumerate(selected):
+            path = entry.get("path") or ""
+            if index >= len(links):
+                break
+            if not file_is_episode(path, episode.season, episode.number, series_name):
+                continue
+            fresh, uerr = rd_call(cfg, "/unrestrict/link", socks_port=socks_port,
+                                  post={"link": links[index]})
+            if fresh and fresh.get("download"):
+                found.append(Source(
+                    quality=guess_quality(path),
+                    size=human_size(entry.get("bytes")),
+                    provider="already on Real-Debrid",
+                    filename=path.lstrip("/"), cached=True,
+                    url=fresh["download"], direct=True))
+        if found:
+            say("Recovered %s from a torrent already on the debrid account."
+                % episode.code())
+            return found, ""
+    return [], ""
+
+
+def guess_quality(name):
+    for tag in ("2160p", "4k", "1080p", "720p", "480p"):
+        if tag in (name or "").lower():
+            return "4k" if tag in ("2160p", "4k") else tag
+    return ""
+
+
+def human_size(num):
+    try:
+        num = float(num or 0)
+    except (TypeError, ValueError):
+        return ""
+    if num <= 0:
+        return ""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if num < 1024 or unit == "TB":
+            return "%.2f %s" % (num, unit) if unit not in ("B", "KB") else "%d %s" % (num, unit)
+        num /= 1024
+    return ""
 
 
 def cinemeta_search(query, socks_port=None, cache=None, refresh=False):
@@ -2767,12 +2958,26 @@ class BrowseWindow(Adw.Window):
         socks = self._socks()
         picks = []
         shape_logged = False
+        fell_back = False
         for i, ep in enumerate(episodes, 1):
             self.say("Looking up %s (%d of %d)…" % (ep.code(), i, len(episodes)))
             sources, err = torrentio_sources(self.cfg, ep.stream_id(), socks_port=socks,
                                              cache=self.main.cache, refresh=self.refresh)
             if err:
                 self._log("Torrentio lookup failed for %s: %s" % (ep.code(), err))
+            if not sources:
+                # The source addon is unreachable or knows nothing. The episode
+                # may still be sitting on the debrid account from last time, and
+                # that copy needs no torrent index at all.
+                self.say("Torrentio gave nothing for %s — checking what is already "
+                         "on your debrid account…" % ep.code())
+                series_name = getattr(self.chosen_series, "name", "")
+                sources, rderr = rd_fallback_sources(
+                    self.cfg, ep, series_name, socks_port=socks, log=self._log)
+                if rderr:
+                    self._log("Real-Debrid fallback failed for %s: %s" % (ep.code(), rderr))
+                elif sources:
+                    fell_back = True
             if sources and not shape_logged:
                 # The debrid key changes Torrentio's reply shape. Say which one
                 # arrived rather than assuming it.
@@ -2796,8 +3001,11 @@ class BrowseWindow(Adw.Window):
                 bits.append("%d with no source at all" % missing)
             if uncached:
                 bits.append("%d not on the debrid server yet" % uncached)
-            self.status.set_text("; ".join(bits) if bits
-                                 else "Every episode has a source that is ready to play.")
+            summary = "; ".join(bits) if bits else \
+                "Every episode has a source that is ready to play."
+            if fell_back:
+                summary += "  Some came from your debrid account, not Torrentio."
+            self.status.set_text(summary)
             self.set_busy(False)
             return False
 
@@ -2863,7 +3071,11 @@ class BrowseWindow(Adw.Window):
         if not usable:
             self.say("Nothing to add — none of these episodes has a source.")
             return
-        if not self.main.session.tunnel_alive():
+        # In host mode there is no tunnel and none is wanted: this machine is
+        # the exit point, so a link resolved straight from here is already
+        # coming from the right address. Requiring a tunnel here is what stopped
+        # the host queueing anything at all.
+        if self.cfg["role"] != "host" and not self.main.session.tunnel_alive():
             if self.cfg["require_verified"]:
                 self.say("The tunnel is not up. Run “Check the route” first so the "
                          "links are made from the host's address, not this machine's.")
@@ -2893,6 +3105,11 @@ class BrowseWindow(Adw.Window):
                      % (ep.code(), i, len(picks)))
             if not src.url:
                 failed.append("%s (no resolvable link — is the debrid key set?)" % ep.code())
+                continue
+            if src.direct:
+                # Came straight from the debrid account, so it is already the
+                # final link -- resolving it again would only cost a round trip.
+                urls.append((ep, src.url))
                 continue
             final, err = curl_final_url(src.url, socks_port=socks)
             if not final:
@@ -3438,6 +3655,9 @@ class Window(Adw.ApplicationWindow):
     def on_role_changed(self, *_a):
         role = self.stack.get_visible_child_name() or "client"
         self.cfg["role"] = role
+        # No widget carries the role, so collect() never sees it and nothing
+        # else would schedule the save that makes it survive a restart.
+        self._on_setting_changed()
         host_mode = role == "host"
         self.frame_verify.set_visible(not host_mode)
         self.btn_launch.set_label("Start watching")

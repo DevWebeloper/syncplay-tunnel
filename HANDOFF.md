@@ -959,3 +959,53 @@ container before scanning. Only on the launch scan, never on a manual rescan.
 Tests: `test_extras.py`, 20 checks — tick state across pick, unpick, select-all
 and unselect-all; selection still feeding `find_sources`; and autostart firing
 only for a remembered distrobox, only with the switch on, and never on a rescan.
+
+### 18.7 Host could not queue anything
+
+`BrowseWindow.on_add` refused unless `session.tunnel_alive()`. In host mode no
+tunnel is ever opened — that machine is the exit point — so the host was locked
+out of the playlist permanently while the client worked fine.
+
+The gate now skips host mode entirely. `_socks()` already returns `None` there,
+so links resolve straight from the host, which is the correct address by
+definition. Tested with no tunnel running in either role: the client is still
+blocked, the host queues.
+
+### 18.8 Falling back to what the account already holds
+
+When Torrentio returns nothing — outage or otherwise — the episode may already be
+on the debrid account, and then no torrent index is needed at all.
+
+`rd_fallback_sources()` tries two things:
+
+1. `GET /downloads?limit=200` — entries carry a `download` field that is already
+   a final CDN link. A match is returned as a `Source` with **`direct=True`**.
+2. failing that, `GET /torrents?limit=200` for a `downloaded` torrent whose name
+   matches the series, then `/torrents/info/{id}` to find the episode among its
+   **selected** files. `links` corresponds to selected files **in order**, so the
+   index of the matching file indexes `links`; that link goes through
+   `/unrestrict/link` for a fresh URL.
+
+`Source.direct` means the URL needs no resolving, and `_resolve_worker` passes it
+through untouched — saving the ~80s round trip these would otherwise cost.
+
+`file_is_episode()` is loose on the name and strict on the numbering: `SxxEyy`
+and `4x01` are both understood, `S04E010` does not match E01, a year in the
+series title is ignored, and every remaining title word must appear. Getting this
+wrong plays the wrong episode, which is worse than finding nothing.
+
+**The token stays out of `ps`.** `rd_auth_file()` writes `header = "Authorization:
+Bearer …"` to a 0600 temp file passed as `curl -K`, rather than a `-H` argument,
+and removes it afterwards.
+
+Verified against the live account: the fallback found `The.Flash.2014.S04E01`
+already in `/downloads`, returned it as a direct 1080p/678 MB source, and the key
+appeared nowhere in the resulting URL.
+
+### 18.9 The role stopped being remembered
+
+`cfg["role"]` has no widget, so `collect()` never touches it — it is set by
+`on_role_changed`. That was fine while a Save button existed; once settings
+started saving themselves (§18.3), switching role and closing the app lost the
+choice. `on_role_changed` now schedules the same debounced save. Asserted by
+writing, reloading `Config()`, and reading the role back.
