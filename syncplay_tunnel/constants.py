@@ -33,6 +33,10 @@ HISTORY_MAX = 30
 TRANSIENT_HTTP = {408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
 RETRY_BACKOFF = (2, 5, 10)
 
+# Once the source addon has failed, stop asking for a while. Retrying it for
+# every episode of a queue turns one outage into minutes of waiting.
+TORRENTIO_COOLDOWN = 300
+
 # Stand-in for the debrid key inside anything written to disk. Torrentio puts
 # the key in its URL path, so a cached source list would otherwise leak it into
 # a file that exists purely for speed.
@@ -94,6 +98,10 @@ DEFAULTS = {
     # ready instead of showing up stopped.
     "autostart_container": True,
     "preferred_quality": "1080p",
+    # Look on the debrid account before asking the source addon. A copy that is
+    # already there needs no lookup and no resolving, so it is both faster and
+    # immune to the addon being down.
+    "prefer_rd_cache": True,
     # Where the last session got to, so reopening the browser lands on the next
     # episode instead of the search box. Set programmatically, no widget.
     "library_series_id": "",

@@ -6,9 +6,9 @@ promise — check the file.
 
 | File | Lines | What it holds |
 |---|---|---|
-| `syncplay_tunnel/constants.py` | 117 | Every fixed value in one place: paths, limits, endpoints and defaults. |
+| `syncplay_tunnel/constants.py` | 125 | Every fixed value in one place: paths, limits, endpoints and defaults. |
 | `syncplay_tunnel/gtk_setup.py` | 22 | Pin the GTK and libadwaita versions before anything imports them. |
-| `syncplay_tunnel/library.py` | 468 | Stremio's addons and the debrid account, spoken directly. |
+| `syncplay_tunnel/library.py` | 495 | Stremio's addons and the debrid account, spoken directly. |
 | `syncplay_tunnel/playlist.py` | 173 | Setting the room's shared playlist over Syncplay's own protocol. |
 | `syncplay_tunnel/proxy.py` | 203 | A local HTTP CONNECT proxy that forwards over the SSH SOCKS5 tunnel. |
 | `syncplay_tunnel/runtimes.py` | 356 | Where Syncplay can be launched from: this system, or any distrobox. |
@@ -18,9 +18,9 @@ promise — check the file.
 | `syncplay_tunnel/syncplay_ini.py` | 103 | Editing Syncplay's own configuration file. |
 | `syncplay_tunnel/tailscale.py` | 51 | Reading the Tailscale peer list. |
 | `syncplay_tunnel/ui/app.py` | 53 | Application object and entry point. |
-| `syncplay_tunnel/ui/browse.py` | 562 | The episode browser: search, episodes, the chosen sources, one source list. |
+| `syncplay_tunnel/ui/browse.py` | 581 | The episode browser: search, episodes, the chosen sources, one source list. |
 | `syncplay_tunnel/ui/widgets.py` | 189 | Shared widget helpers and the stylesheet. |
-| `syncplay_tunnel/ui/window.py` | 1562 | The main window: a sidebar over Watch, Route, Where, Setup and Activity. |
+| `syncplay_tunnel/ui/window.py` | 1566 | The main window: a sidebar over Watch, Route, Where, Setup and Activity. |
 | `syncplay_tunnel/util.py` | 239 | Small shared helpers: running commands, fetching over curl, ports. |
 
 ## Two things to know before editing
@@ -38,7 +38,7 @@ GTK, because `gi.require_version` has to run first. Every UI module and
 
 ### `syncplay_tunnel/constants.py`
 
-**Constants:** `APP_ID`, `APP_NAME`, `CONFIG_DIR`, `CONFIG_FILE`, `DATA_DIR`, `LOG_FILE`, `CACHE_FILE`, `HISTORY_FILE`, `CACHE_TTL`, `CACHE_MAX_ENTRIES`, `HISTORY_MAX`, `TRANSIENT_HTTP`, `RETRY_BACKOFF`, `KEY_TOKEN`, `IP_ECHOS`, `CINEMETA`, `RD_API`, `TORRENTIO`, `PLAYLIST_MAX_ITEMS`, `PLAYLIST_MAX_CHARACTERS`, `DEFAULTS`, `TAILSCALE_NET`, `KEY_OPTIONS`, `SYNCPLAY_SECTION`, `SYNCPLAY_DEFAULT_PORT`, `SYNCPLAY_PROTOCOL_VERSION`, `FLATPAK_IDS`, `PROBE`
+**Constants:** `APP_ID`, `APP_NAME`, `CONFIG_DIR`, `CONFIG_FILE`, `DATA_DIR`, `LOG_FILE`, `CACHE_FILE`, `HISTORY_FILE`, `CACHE_TTL`, `CACHE_MAX_ENTRIES`, `HISTORY_MAX`, `TRANSIENT_HTTP`, `RETRY_BACKOFF`, `TORRENTIO_COOLDOWN`, `KEY_TOKEN`, `IP_ECHOS`, `CINEMETA`, `RD_API`, `TORRENTIO`, `PLAYLIST_MAX_ITEMS`, `PLAYLIST_MAX_CHARACTERS`, `DEFAULTS`, `TAILSCALE_NET`, `KEY_OPTIONS`, `SYNCPLAY_SECTION`, `SYNCPLAY_DEFAULT_PORT`, `SYNCPLAY_PROTOCOL_VERSION`, `FLATPAK_IDS`, `PROBE`
 
 ### `syncplay_tunnel/library.py`
 
@@ -46,7 +46,7 @@ GTK, because `gi.require_version` has to run first. Every UI module and
 
 **Classes:** `Series`, `Episode`, `Source`
 
-**Functions:** `parse_source()`, `rd_auth_file()`, `rd_call()`, `file_is_episode()`, `rd_fallback_sources()`, `guess_quality()`, `human_size()`, `cinemeta_search()`, `cinemeta_episodes()`, `torrentio_url()`, `torrentio_sources()`, `pick_source()`
+**Functions:** `parse_source()`, `rd_auth_file()`, `rd_call()`, `file_is_episode()`, `rd_fallback_sources()`, `guess_quality()`, `human_size()`, `cinemeta_search()`, `cinemeta_episodes()`, `torrentio_url()`, `torrentio_is_down()`, `torrentio_note_failure()`, `torrentio_note_success()`, `torrentio_sources()`, `pick_source()`
 
 ### `syncplay_tunnel/playlist.py`
 

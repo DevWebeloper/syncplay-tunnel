@@ -940,6 +940,10 @@ class Window(Adw.ApplicationWindow):
                     "pipe-joined, e.g. sort=qualitysize|qualityfilter=cam,scr")
         self._entry(lib, "Preferred quality", "preferred_quality",
                     "matched exactly first, e.g. 1080p")
+        self._switch(lib, "Use what is already on Real-Debrid first",
+                     "prefer_rd_cache",
+                     "An episode already on the account plays at once and needs no "
+                     "source lookup, so Torrentio is only asked when it is not there.")
         page.add(lib)
 
         play = Adw.PreferencesGroup(title="Playback")

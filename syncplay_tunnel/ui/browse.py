@@ -5,7 +5,8 @@ from .. import gtk_setup  # noqa: F401  (must precede gi.repository)
 from gi.repository import Adw, GLib, Gtk
 
 from ..library import (Series, cinemeta_episodes, cinemeta_search, pick_source,
-                       rd_fallback_sources, torrentio_sources)
+                       rd_fallback_sources, torrentio_is_down,
+                       torrentio_sources)
 from ..util import curl_final_url, redact
 from .widgets import (check_row, checked_rows, clear_list, list_row,
                       scrolled_list, toggle_row)
@@ -377,17 +378,31 @@ class BrowseWindow(Adw.Window):
         fell_back = False
         for i, ep in enumerate(episodes, 1):
             self.say("Looking up %s (%d of %d)…" % (ep.code(), i, len(episodes)))
-            sources, err = torrentio_sources(self.cfg, ep.stream_id(), socks_port=socks,
-                                             cache=self.main.cache, refresh=self.refresh)
-            if err:
-                self._log("Torrentio lookup failed for %s: %s" % (ep.code(), err))
+            sources, err = [], ""
+            series_name = getattr(self.chosen_series, "name", "")
+
+            # A copy already on the debrid account needs no lookup and no
+            # resolving, so it is both the fastest answer and the one that still
+            # works when the addon is unreachable. Worth asking first.
+            if self.cfg["prefer_rd_cache"]:
+                sources, rderr = rd_fallback_sources(
+                    self.cfg, ep, series_name, socks_port=socks, log=self._log)
+                if sources:
+                    fell_back = True
+                elif rderr:
+                    self._log("Real-Debrid lookup failed for %s: %s" % (ep.code(), rderr))
+
+            if not sources:
+                sources, err = torrentio_sources(self.cfg, ep.stream_id(), socks_port=socks,
+                                                 cache=self.main.cache, refresh=self.refresh)
+                if err:
+                    self._log("Torrentio lookup failed for %s: %s" % (ep.code(), err))
             if not sources:
                 # The source addon is unreachable or knows nothing. The episode
                 # may still be sitting on the debrid account from last time, and
                 # that copy needs no torrent index at all.
                 self.say("Torrentio gave nothing for %s — checking what is already "
                          "on your debrid account…" % ep.code())
-                series_name = getattr(self.chosen_series, "name", "")
                 sources, rderr = rd_fallback_sources(
                     self.cfg, ep, series_name, socks_port=socks, log=self._log)
                 if rderr:
@@ -420,7 +435,11 @@ class BrowseWindow(Adw.Window):
             summary = "; ".join(bits) if bits else \
                 "Every episode has a source that is ready to play."
             if fell_back:
-                summary += "  Some came from your debrid account, not Torrentio."
+                summary += "  Some came straight from your debrid account."
+            waiting = torrentio_is_down()
+            if waiting:
+                summary += ("  Torrentio is not answering; it will be tried again "
+                            "in %ds." % int(waiting))
             self.status.set_text(summary)
             self.set_busy(False)
             return False

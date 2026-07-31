@@ -11,10 +11,12 @@ import json
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import quote
 
-from .constants import CINEMETA, KEY_TOKEN, RD_API, TORRENTIO
+from .constants import (CINEMETA, KEY_TOKEN, RD_API, TORRENTIO,
+                        TORRENTIO_COOLDOWN)
 from .util import _scrubbed_env, curl_json, redact, run
 
 # The manual loop this replaces was: open Stremio, let the Torrentio addon put
@@ -423,6 +425,25 @@ def torrentio_url(cfg, stream_id):
     return "%s%s/stream/series/%s.json" % (TORRENTIO, prefix, quote(stream_id))
 
 
+# When the addon last failed. Asking again before this passes is just waiting.
+_torrentio_down_until = 0.0
+
+
+def torrentio_is_down():
+    """Seconds left on the cooldown, 0 when the addon is worth asking."""
+    return max(0.0, _torrentio_down_until - time.time())
+
+
+def torrentio_note_failure():
+    global _torrentio_down_until
+    _torrentio_down_until = time.time() + TORRENTIO_COOLDOWN
+
+
+def torrentio_note_success():
+    global _torrentio_down_until
+    _torrentio_down_until = 0.0
+
+
 def torrentio_sources(cfg, stream_id, socks_port=None, cache=None, refresh=False):
     """Sources for one episode, best first. Returns (sources, error)."""
     key = str(cfg["rd_api_key"] or "").strip()
@@ -433,10 +454,16 @@ def torrentio_sources(cfg, stream_id, socks_port=None, cache=None, refresh=False
         hit = cache.get("sources", ckey)
         if hit is not None:
             return [Source.from_dict(d, key) for d in hit], ""
+    waiting = torrentio_is_down()
+    if waiting:
+        # Do not spend another timeout per episode on a service that just failed.
+        return [], "skipped — Torrentio failed recently, trying again in %ds" % int(waiting)
     data, err = curl_json(torrentio_url(cfg, stream_id), socks_port=socks_port,
                           timeout=40)
     if data is None:
+        torrentio_note_failure()
         return [], err
+    torrentio_note_success()
     found = [parse_source(s) for s in (data.get("streams") or [])]
     if cache is not None and found:
         cache.put("sources", ckey, [s.to_dict(key) for s in found])

@@ -269,6 +269,17 @@ Metadata comes from [Cinemeta](https://v3-cinemeta.strem.io) and sources from
 [Torrentio](https://torrentio.strem.fun) — the same two addons Stremio itself
 uses, spoken directly over plain JSON.
 
+### What is already on your account comes first
+
+Before asking Torrentio anything, the app looks at the debrid account. An episode
+already sitting there needs **no source lookup and no resolving** — its link is
+already final — so it plays at once and keeps working when the addon is down.
+Torrentio is only asked when the account has nothing.
+
+That is *Use what is already on Real-Debrid first* under **Setup ▸ Library**, on
+by default. Turn it off to always see Torrentio's full list, at the cost of the
+wait.
+
 ### When the source addon is having a bad day
 
 Torrentio sits behind Cloudflare, which answers `522` when it cannot reach the
@@ -276,6 +287,10 @@ addon itself. A failed lookup is retried three times with a growing pause before
 it gives up, so one bad moment does not end a whole queue, and the log names the
 status rather than blaming the JSON. A `404` is not retried — that one means what
 it says.
+
+Once it has failed, it is left alone for five minutes. Without that, every
+episode of a queue pays for the same outage again; with it, a dead addon costs
+one timeout rather than one per episode.
 
 If everything fails at once, the service is down — and the app then asks your
 debrid account directly. Anything you have already watched or already have a
@@ -488,6 +503,7 @@ only launches if it passes.
 | Real-Debrid API key | — | From [real-debrid.com/apitoken](https://real-debrid.com/apitoken). Needed by **Browse…**; kept out of every log. |
 | Torrentio options | `sort=qualitysize` | Pipe-joined, e.g. `sort=seeders\|qualityfilter=480p,scr,cam`. A `realdebrid=` here is replaced by the key above. |
 | Preferred quality | `1080p` | Matched exactly first, so it won't settle for `1080p 3D SBS` while a plain 1080p release exists. |
+| Use what is already on Real-Debrid first | on | Skips the source lookup entirely for episodes the account already has. |
 | Require a verified route | on | Leave this on. It's the whole point — it also blocks link resolution while the tunnel is down. |
 | Stop the container on drop | on | Shuts the distrobox down too when the tunnel dies. |
 | Skip Syncplay's setup dialog | on | Writes `forceguiprompt = False` to `~/.config/syncplay.ini`. Only takes effect when a URL is set. |

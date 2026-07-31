@@ -1075,3 +1075,31 @@ to a console interface with no playlist at all — useless here.
 So the nearest thing that keeps the GUI: `last_play_url` remembers whatever was
 launched, and a blank URL falls back to it. With nothing remembered the dialog is
 unavoidable, and the log says so plainly rather than pretending.
+
+### 19.3 Asking the account before the addon
+
+Reported with a worked example: Torrentio down, but `Arrow (2012) Season 4` was
+already cached on the account, and the fix by hand was to copy the RD link,
+unrestrict it, and paste the result into the URL field.
+
+The fallback from §18.8 already produced exactly that URL — verified against the
+live account, `23-4.download.real-debrid.com/d/…/Arrow.S04E01…`, in **0.3s**. The
+problem was never the mechanism, it was the ordering: the fallback only ran
+*after* Torrentio, and a dead Torrentio costs three retries with backoff per
+episode before it gives up.
+
+Two changes:
+
+- **`prefer_rd_cache` (default on)** — look on the account first. A copy already
+  there needs no lookup and no resolving, so it is both the fastest answer and
+  the one immune to the addon being down. Torrentio is asked only when the
+  account has nothing.
+- **A cooldown.** `torrentio_is_down()` / `note_failure()` / `note_success()` in
+  `library.py` keep the addon off the hook for `TORRENTIO_COOLDOWN` (300s) after
+  a failure, so one outage costs one timeout instead of one per episode.
+
+`test_arrow.py` drives the reported case with `torrentio_sources` stubbed to fail
+every time: three Arrow episodes found in **2.3s**, Torrentio never asked at all,
+every source `direct`, and resolution finishing in **0.1s** because those links
+are already final. Also asserts the breaker returns immediately while armed and
+clears on the next success.
