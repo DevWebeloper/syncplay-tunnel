@@ -925,3 +925,37 @@ That is how the corrupted port values in §18.1 were spotted at all.
 
 Not covered: the app under a real user's hands on Silverblue, and a two-machine
 watch-through — her laptop was offline for this round too.
+
+### 18.6 Follow-ups from first real use
+
+**Torrentio 522s.** A queue died with `Could not resolve S03E02 (HTTP 522)` three
+times, then `not JSON (Expecting value: line 1 column 1 (char 0))`. Both are the
+same thing: Cloudflare cannot reach the addon, so it answers 522, and for the
+JSON endpoint it returns an HTML error page. Confirmed live — `manifest.json`
+would not load at all while a stream query took **19.4s**.
+
+Two fixes. `curl_json` now captures `%{http_code}`, so a gateway failure is
+reported as `HTTP 522` instead of a JSON parse error, and an unparseable body
+quotes what actually arrived. Both it and `curl_final_url` retry on
+`TRANSIENT_HTTP` (408/425/429/5xx/52x) with a 2/5/10s backoff; anything else,
+`404` included, fails immediately. Proven against a local server: 522 retries
+three times, 404 retries none, and a source that fails twice then succeeds now
+comes back.
+
+**Ticks on picked episodes.** Multi-select highlighting alone was easy to lose
+track of across a season, so `check_row()` puts an `object-select-symbolic` in
+each row and `sync_checks()` shows it on exactly the selected ones. The icon
+stays in the layout at zero opacity so text does not shift as rows are ticked.
+Selection itself is unchanged, so `get_selected_rows()` still drives everything.
+
+**Remembering the environment.** `runtime_kind`/`container` were already saved
+and re-selected, but a stopped container came back as "not scanned" and could not
+be launched without a manual rescan. `start_container()` runs `<mgr> start
+<name>` — the same call that proved reliable in the systemd unit, and a no-op
+when already up — and `_scan_worker(autostart=True)` calls it for the remembered
+container before scanning. Only on the launch scan, never on a manual rescan.
+`autostart_container` (default on) controls it.
+
+Tests: `test_extras.py`, 20 checks — tick state across pick, unpick, select-all
+and unselect-all; selection still feeding `find_sources`; and autostart firing
+only for a remembered distrobox, only with the switch on, and never on a rescan.

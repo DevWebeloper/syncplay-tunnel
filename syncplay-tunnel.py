@@ -75,6 +75,12 @@ CACHE_TTL = {
 CACHE_MAX_ENTRIES = 400
 HISTORY_MAX = 30
 
+# Statuses worth trying again. The source addon sits behind Cloudflare, which
+# answers 52x when it cannot reach the addon itself — seen in the wild as a run
+# of 522s while the service was overloaded. None of those mean "no such thing".
+TRANSIENT_HTTP = {408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
+RETRY_BACKOFF = (2, 5, 10)
+
 # Stand-in for the debrid key inside anything written to disk. Torrentio puts
 # the key in its URL path, so a cached source list would otherwise leak it into
 # a file that exists purely for speed.
@@ -128,6 +134,9 @@ DEFAULTS = {
     # the Stremio addon, and it lands in config.json, which is written 0600.
     "rd_api_key": "",
     "torrentio_opts": "sort=qualitysize",
+    # Start the container you last launched from when the app opens, so it is
+    # ready instead of showing up stopped.
+    "autostart_container": True,
     "preferred_quality": "1080p",
     # Where the last session got to, so reopening the browser lands on the next
     # episode instead of the search box. Set programmatically, no widget.
@@ -206,31 +215,61 @@ def _scrubbed_env():
     return env
 
 
-def curl_json(url, socks_port=None, timeout=20):
-    """Fetch JSON with curl. Returns (data, error) — data is None on failure.
-
-    Every other fetch in this app shells out to curl, which keeps the zero-pip
-    promise and, more usefully, makes the route an explicit argument: pass a
-    port to go through the tunnel, pass nothing to go direct.
-    """
+def _curl_json_once(url, socks_port, timeout):
+    """One attempt. Returns (data, error, worth_retrying)."""
     cmd = ["curl", "-s", "-L", "--max-time", str(timeout),
-           "-H", "Accept: application/json"]
+           "-H", "Accept: application/json",
+           # The status is needed to tell "the service is broken" apart from
+           # "the service answered something we cannot read".
+           "-w", "\n%{http_code}"]
     if socks_port:
         cmd += ["--socks5-hostname", "127.0.0.1:%d" % socks_port]
     else:
         cmd += ["--noproxy", "*"]
     rc, out, err = run(cmd + [url], timeout=timeout + 5, env=_scrubbed_env())
     if rc != 0:
-        return None, err or "curl exited %s" % rc
-    if not out.strip():
-        return None, "empty reply"
+        # 28 is curl's own timeout; everything at this level is worth another go.
+        return None, (err or "curl exited %s" % rc), True
+
+    body, _, code = out.rpartition("\n")
+    code = code.strip()
+    if code.isdigit() and not code.startswith("2"):
+        return None, "HTTP %s" % code, int(code) in TRANSIENT_HTTP
+    if not body.strip():
+        return None, "empty reply", True
     try:
-        return json.loads(out), ""
-    except ValueError as exc:
-        return None, "not JSON (%s)" % exc
+        return json.loads(body), "", False
+    except ValueError:
+        # A gateway that is failing hands back an HTML error page, so say what
+        # actually came back rather than blaming the JSON.
+        head = body.strip()[:60].replace("\n", " ")
+        return None, "HTTP %s but the reply was not JSON: %s…" % (code or "?", head), True
 
 
-def curl_final_url(url, socks_port=None, timeout=180):
+def curl_json(url, socks_port=None, timeout=20, attempts=3):
+    """Fetch JSON with curl. Returns (data, error) — data is None on failure.
+
+    Every other fetch in this app shells out to curl, which keeps the zero-pip
+    promise and, more usefully, makes the route an explicit argument: pass a
+    port to go through the tunnel, pass nothing to go direct.
+
+    Retried, because the source addon sits behind a gateway that intermittently
+    cannot reach it and answers 522 or an HTML error page. One of those should
+    not end a whole queue.
+    """
+    err = "no attempt made"
+    for attempt in range(max(1, attempts)):
+        if attempt:
+            time.sleep(RETRY_BACKOFF[min(attempt - 1, len(RETRY_BACKOFF) - 1)])
+        data, err, retry = _curl_json_once(url, socks_port, timeout)
+        if data is not None:
+            return data, ""
+        if not retry:
+            break
+    return None, err
+
+
+def curl_final_url(url, socks_port=None, timeout=180, attempts=3):
     """Follow redirects and report where they land. Returns (url, error).
 
     Asks for one byte rather than issuing a HEAD: some CDNs answer HEAD with
@@ -248,13 +287,23 @@ def curl_final_url(url, socks_port=None, timeout=180):
         cmd += ["--socks5-hostname", "127.0.0.1:%d" % socks_port]
     else:
         cmd += ["--noproxy", "*"]
-    rc, out, err = run(cmd + [url], timeout=timeout + 5, env=_scrubbed_env())
-    if rc != 0:
-        return None, err or "curl exited %s" % rc
-    final, _, code = out.strip().partition("\t")
-    if not code.startswith("2"):
-        return None, "HTTP %s" % (code or "?")
-    return final or None, "" if final else "no redirect target"
+
+    err = "no attempt made"
+    for attempt in range(max(1, attempts)):
+        if attempt:
+            time.sleep(RETRY_BACKOFF[min(attempt - 1, len(RETRY_BACKOFF) - 1)])
+        rc, out, cerr = run(cmd + [url], timeout=timeout + 5, env=_scrubbed_env())
+        if rc != 0:
+            err = cerr or "curl exited %s" % rc
+            continue
+        final, _, code = out.strip().partition("\t")
+        code = code.strip()
+        if code.startswith("2"):
+            return (final, "") if final else (None, "no redirect target")
+        err = "HTTP %s" % (code or "?")
+        if code.isdigit() and int(code) not in TRANSIENT_HTTP:
+            break
+    return None, err
 
 
 def notify(title, body, urgent=False):
@@ -980,6 +1029,26 @@ def probe_container(rt, mgr, allow_start=False, log=None):
     rt.has_syncplay = "HAVE_SP" in out
     rt.has_mpv = "HAVE_MPV" in out
     return rt
+
+
+def start_container(name, log=None):
+    """Bring one container up. Returns True when it is running afterwards.
+
+    `podman start` is used rather than `distrobox enter`, because it returns as
+    soon as the container is up instead of holding a shell open, and it is a
+    no-op when the container is already running.
+    """
+    if not name:
+        return False
+    mgr = container_manager()
+    if mgr is None:
+        if log:
+            log("No podman or docker reachable, so %s cannot be started." % name)
+        return False
+    rc, _, err = host_run([mgr, "start", name], timeout=120)
+    if rc != 0 and log:
+        log("Could not start %s: %s" % (name, err or "exit %s" % rc))
+    return rc == 0
 
 
 def scan_runtimes(allow_start=False, log=None):
@@ -2272,6 +2341,49 @@ def list_row(text, dim=False, payload=None, attr="item"):
     return row
 
 
+def check_row(text, payload=None, attr="item"):
+    """A row that shows a tick when it is selected.
+
+    Multi-select highlighting alone is easy to lose track of when picking a
+    handful of episodes out of a season, so the chosen ones say so outright.
+    """
+    row = Gtk.ListBoxRow()
+    box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+    box.set_margin_top(8)
+    box.set_margin_bottom(8)
+    box.set_margin_start(10)
+    box.set_margin_end(10)
+
+    mark = Gtk.Image.new_from_icon_name("object-select-symbolic")
+    # Kept in the layout at all times so the text does not shift as rows are
+    # ticked and unticked.
+    mark.set_opacity(0.0)
+    box.append(mark)
+
+    label = Gtk.Label(label=text, xalign=0)
+    label.set_wrap(True)
+    label.set_max_width_chars(60)
+    label.set_hexpand(True)
+    box.append(label)
+
+    row.set_child(box)
+    row.check = mark
+    if payload is not None:
+        setattr(row, attr, payload)
+    return row
+
+
+def sync_checks(listbox):
+    """Show the tick on exactly the selected rows."""
+    selected = set(listbox.get_selected_rows())
+    child = listbox.get_first_child()
+    while child:
+        mark = getattr(child, "check", None)
+        if mark is not None:
+            mark.set_opacity(1.0 if child in selected else 0.0)
+        child = child.get_next_sibling()
+
+
 def scrolled_list(mode=Gtk.SelectionMode.SINGLE, min_height=150, max_height=320):
     """A ListBox in a vertical-only scroller. Returns (scroller, listbox)."""
     lb = Gtk.ListBox()
@@ -2428,10 +2540,14 @@ class BrowseWindow(Adw.Window):
 
         sw_e, self.episode_list = scrolled_list(Gtk.SelectionMode.MULTIPLE,
                                                 min_height=220, max_height=420)
+        self.episode_list.connect("selected-rows-changed",
+                                  lambda lb: sync_checks(lb))
         split.append(sw_e)
         page.append(split)
 
-        hint = Gtk.Label(label="Tick one episode or several — ctrl-click and shift-click both work.",
+        hint = Gtk.Label(label="Pick one episode or several — ctrl-click adds one, "
+                               "shift-click takes a run. Ticked ones are the ones "
+                               "that will be queued.",
                          xalign=0)
         hint.set_wrap(True)
         hint.add_css_class("dim")
@@ -2619,13 +2735,14 @@ class BrowseWindow(Adw.Window):
         resume_here = season == self.resume_season and self.resume_after > 0
         pick = None
         for ep in [e for e in self.episodes if e.season == season]:
-            r = list_row(ep.label(), payload=ep, attr="episode")
+            r = check_row(ep.label(), payload=ep, attr="episode")
             self.episode_list.append(r)
             # Land on the one after wherever the last session stopped.
             if resume_here and ep.number == self.resume_after + 1:
                 pick = r
         if pick is not None:
             self.episode_list.select_row(pick)
+        sync_checks(self.episode_list)
 
     # -- sources ---------------------------------------------------------- #
 
@@ -2863,7 +2980,7 @@ class Window(Adw.ApplicationWindow):
 
         self.on_role_changed()
         self._env_banner()
-        threading.Thread(target=self._scan_worker, daemon=True).start()
+        threading.Thread(target=self._scan_worker, args=(True,), daemon=True).start()
         self.refresh_peers()
         self.refresh_history()
         if autolaunch:
@@ -3378,9 +3495,12 @@ class Window(Adw.ApplicationWindow):
         box.append(buttons)
 
         options = Adw.PreferencesGroup()
+        self._switch(options, "Start the environment I used last", "autostart_container",
+                     "Brings that container up when the app opens, so it is ready "
+                     "instead of showing up stopped.")
         self._switch(options, "Start stopped containers while scanning", "scan_stopped",
-                     "A stopped container has to be started before it can be looked "
-                     "inside.")
+                     "Applies to every other container too, which means starting all "
+                     "of them just to look inside.")
         box.append(options)
 
         self.where_note = self._note(
@@ -3544,7 +3664,18 @@ class Window(Adw.ApplicationWindow):
         self.where_note.set_text("Scanning…")
         threading.Thread(target=self._scan_worker, daemon=True).start()
 
-    def _scan_worker(self):
+    def _scan_worker(self, autostart=False):
+        # Bring the remembered container up before scanning, so it is probed as
+        # a running one and comes back selected and ready rather than "stopped,
+        # not scanned" — which is what it looked like every launch otherwise.
+        if (autostart and self.cfg["autostart_container"]
+                and self.cfg["runtime_kind"] == "distrobox" and self.cfg["container"]):
+            name = str(self.cfg["container"]).strip()
+            if name and name != current_container():
+                self.log("Starting %s, the environment you used last…" % name)
+                if start_container(name, log=self.log):
+                    self.log("%s is up." % name)
+
         found = scan_runtimes(allow_start=bool(self.cfg["scan_stopped"]), log=self.log)
 
         def apply():

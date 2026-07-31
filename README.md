@@ -269,6 +269,17 @@ Metadata comes from [Cinemeta](https://v3-cinemeta.strem.io) and sources from
 [Torrentio](https://torrentio.strem.fun) — the same two addons Stremio itself
 uses, spoken directly over plain JSON.
 
+### When the source addon is having a bad day
+
+Torrentio sits behind Cloudflare, which answers `522` when it cannot reach the
+addon itself. A failed lookup is retried three times with a growing pause before
+it gives up, so one bad moment does not end a whole queue, and the log names the
+status rather than blaming the JSON. A `404` is not retried — that one means what
+it says.
+
+If everything fails at once, the service is down; the Refresh button and a few
+minutes are the fix.
+
 ### One link, one address
 
 Each episode is resolved **once, through the tunnel**, and the resolved link is
@@ -445,7 +456,8 @@ only launches if it passes.
 |---|---|---|
 | SOCKS5 port | 8080 | Used by yt-dlp and `ALL_PROXY`. |
 | HTTP bridge port | 8118 | Used by mpv/FFmpeg and `http_proxy`. |
-| Start stopped containers | off | Scanning a stopped container requires starting it. Lives on **Where**. |
+| Start the environment I used last | on | Brings that container up when the app opens. Lives on **Where**. |
+| Start stopped containers | off | Scanning every stopped container means starting all of them. Lives on **Where**. |
 | Failures before stopping | 3 | Consecutive failures before everything is killed. |
 | Extra mpv flags | — | Appended to the wrapper, e.g. `--cache=yes --demuxer-max-bytes=200M`. |
 | Watchdog interval | 10 s | How often the tunnel is tested. |
