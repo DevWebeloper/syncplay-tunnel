@@ -21,8 +21,8 @@ from ..sshkeys import (ensure_ssh_key, find_ssh_key, restrict_authorized_key,
 from ..store import Cache, History
 from ..syncplay_ini import prepare_syncplay_ini
 from ..tailscale import tailscale_status
-from ..util import (in_container, is_tailscale_addr, notify, port_open, run,
-                    ssh_clients, stamp, which)
+from ..util import (all_ssh_clients, in_container, is_tailscale_addr, notify,
+                    port_open, run, stamp, which)
 from .browse import BrowseWindow
 from .widgets import (Row, block_scroll_steal, clear_list, list_row,
                       scrolled_list)
@@ -405,7 +405,7 @@ class Window(Adw.ApplicationWindow):
     def _count_worker(self):
         """Who is on our sshd right now. Runs off the main loop: ss is a fork."""
         port = int(self.cfg["host_ssh_port"] or 22)
-        addrs = ssh_clients(port)
+        addrs = all_ssh_clients(port)
         names = {p.ip: p.name for p in self.peers}
 
         def apply():
@@ -1432,12 +1432,21 @@ class Window(Adw.ApplicationWindow):
             self.session.close_tunnel()
         return None
 
-    def on_launch(self, _btn):
+    def on_launch(self, _btn, _rechecked=False):
         self.collect()
         host_mode = self.cfg["role"] == "host"
         if not host_mode and self.cfg["require_verified"] and not self.verified:
-            self.verdict.set_text("Check the route first — or turn the requirement off in Advanced.")
-            self.log("Launch blocked: the route has not been verified in this session.")
+            if _rechecked:
+                # The check just ran and did not pass, so stop rather than loop.
+                self.verdict.set_text("The route did not verify, so nothing was started.")
+                self.log("Launch cancelled: the route check did not pass.")
+                return
+            # Checking the route is a precondition, not a separate chore, so do
+            # it and carry on into the launch when it passes.
+            self.log("Route not verified yet — checking it first.")
+            self.toast("Checking the route…")
+            self.on_test(None)
+            threading.Thread(target=self._launch_after_check, daemon=True).start()
             return
         rt = self.selected_runtime()
         if rt is None:
@@ -1459,6 +1468,18 @@ class Window(Adw.ApplicationWindow):
         self.btn_launch.set_sensitive(False)
         threading.Thread(target=self._launch_worker, args=(rt, host_mode),
                          daemon=True).start()
+
+    def _launch_after_check(self):
+        """Wait out the route check started by on_launch, then go if it passed."""
+        time.sleep(0.6)
+        deadline = time.time() + 120
+        while self.busy and time.time() < deadline:
+            time.sleep(0.3)
+        if self.verified:
+            GLib.idle_add(lambda: (self.on_launch(None, _rechecked=True), False)[1])
+        else:
+            GLib.idle_add(lambda: (self.toast("Route check failed — not starting"),
+                                   False)[1])
 
     def _prepare_syncplay(self, rt):
         """Make Syncplay start playing on its own, if that was asked for.

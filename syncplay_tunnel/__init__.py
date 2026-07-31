@@ -30,9 +30,10 @@ from .sshkeys import (ensure_ssh_key, find_ssh_key, key_line_is_open,
 from .store import Cache, Config, History, JsonStore
 from .syncplay_ini import prepare_syncplay_ini, syncplay_ini_path
 from .tailscale import Peer, tailscale_status
-from .util import (curl_final_url, curl_json, free_port, in_container,
-                   is_tailscale_addr, notify, port_open, redact, run,
-                   ssh_clients, stamp, which, _scrubbed_env, _curl_json_once)
+from .util import (all_ssh_clients, curl_final_url, curl_json, free_port,
+                   in_container, is_tailscale_addr, notify, port_open,
+                   redact, run, ssh_clients, stamp, tailscale_ssh_clients,
+                   which, _scrubbed_env, _curl_json_once)
 
 from .ui.app import App, main
 from .ui.browse import BrowseWindow

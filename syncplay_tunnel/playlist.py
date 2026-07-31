@@ -103,8 +103,12 @@ class SyncplayPush:
         seen.discard(self.username)
         return seen
 
-    def push(self, files, index=0, wait=45.0, timeout=15.0):
-        """Set the room playlist once someone is there to keep it. (ok, message)."""
+    def push(self, files, index=0, wait=45.0, timeout=15.0, settle_wait=20.0):
+        """Set the room playlist once someone is there to keep it. (ok, message).
+
+        `settle_wait` is how long to let the real client publish its own initial
+        playlist before overwriting it, so the queue is not clobbered.
+        """
         files = [f for f in (files or []) if f]
         if not files:
             return False, "Nothing to queue."
@@ -129,6 +133,7 @@ class SyncplayPush:
             deadline = time.time() + wait
             others = set()
             next_ask = 0.0
+            saw_their_playlist = False
             while time.time() < deadline and not others:
                 # The roster has to be asked for. The server volunteers a
                 # Set/user frame when somebody joins *after* us, but says
@@ -153,13 +158,34 @@ class SyncplayPush:
                                "in an empty room is discarded by the server."
                                % (self.room, int(wait)))
 
+            # Syncplay sets the room playlist to its own single file as it
+            # starts (client.py loadDelayedPath -> addFileToPlaylist). Pushing
+            # before that lands means it overwrites the queue a moment later and
+            # only one episode survives -- so wait for its set, then replace it.
+            settle = time.time() + settle_wait
+            while time.time() < settle and not saw_their_playlist:
+                try:
+                    msg = self._read(fh)
+                except (socket.timeout, TimeoutError):
+                    continue
+                if msg is None:
+                    break
+                if "State" in msg:
+                    self._pong(fh, msg)
+                    continue
+                change = (msg.get("Set") or {}).get("playlistChange")
+                if change is not None and change.get("user") != self.username:
+                    saw_their_playlist = True
+
             self._send(fh, {"Set": {"playlistChange": {"files": files}}})
             self._send(fh, {"Set": {"playlistIndex": {"index": index}}})
             # Let the server broadcast before the socket goes away.
             time.sleep(1.0)
-            return True, ("Queued %d episode%s for %s."
+            return True, ("Queued %d episode%s for %s.%s"
                           % (len(files), "" if len(files) == 1 else "s",
-                             ", ".join(sorted(others))))
+                             ", ".join(sorted(others)),
+                             "" if saw_their_playlist
+                             else "  (pushed without seeing their own list first)"))
         except ssl.SSLError as exc:
             return False, "Syncplay server's TLS could not be verified: %s" % exc
         except OSError as exc:

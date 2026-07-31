@@ -219,6 +219,39 @@ def ssh_clients(port=22):
     return found
 
 
+def tailscale_ssh_clients():
+    """Client addresses connected over Tailscale SSH.
+
+    Tailscale intercepts port 22 on the tailnet and terminates those sessions
+    inside tailscaled, so they never reach sshd and `ss` cannot see them -- which
+    is why the host used to report nobody connected while a client was plainly
+    attached. Each session runs as `tailscaled be-child ssh ... --remote-ip=X`,
+    so the addresses can be read straight off the process list.
+    """
+    rc, out, _ = run(["ps", "-eo", "args"], timeout=8)
+    if rc != 0:
+        return []
+    found = []
+    for line in out.splitlines():
+        if "be-child" not in line or " ssh" not in line:
+            continue
+        for token in line.split():
+            if token.startswith("--remote-ip="):
+                addr = token.split("=", 1)[1].strip()
+                if addr and addr not in found:
+                    found.append(addr)
+    return found
+
+
+def all_ssh_clients(port=22):
+    """Everyone attached to this machine over SSH, however they got in."""
+    seen = list(ssh_clients(port))
+    for addr in tailscale_ssh_clients():
+        if addr not in seen:
+            seen.append(addr)
+    return seen
+
+
 def is_tailscale_addr(addr):
     try:
         return ipaddress.ip_address(addr) in TAILSCALE_NET

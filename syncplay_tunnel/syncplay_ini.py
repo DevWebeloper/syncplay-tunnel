@@ -67,11 +67,31 @@ def prepare_syncplay_ini(urls, trust_domain, log=None, path=None):
         parser.set(SYNCPLAY_SECTION, "forceguiprompt", "False")
         changed.append("forceguiprompt = False")
 
+    # Following someone else's file change is the whole point of a shared
+    # playlist. Syncplay defaults it on, but written explicitly so a config that
+    # once turned it off is corrected rather than silently left alone.
+    if not parser.has_option(SYNCPLAY_SECTION, "sharedplaylistenabled") or \
+            parser.get(SYNCPLAY_SECTION, "sharedplaylistenabled") != "True":
+        parser.set(SYNCPLAY_SECTION, "sharedplaylistenabled", "True")
+        changed.append("sharedplaylistenabled = True")
+
     hosts = []
     for u in urls:
         h = urlsplit(u).hostname
-        if h and h not in hosts:
+        if not h:
+            continue
+        if h not in hosts:
             hosts.append(h)
+        # Syncplay matches a "*" in a trusted domain against exactly one label
+        # (client.py _isURITrustableAndTrusted), so one wildcard covers every
+        # debrid edge host. That matters for the OTHER machine: it never queued
+        # anything, so it has never seen these hostnames, and without the
+        # wildcard it stops for a confirmation instead of following the switch.
+        labels = h.split(".")
+        if len(labels) >= 3:
+            wildcard = "*." + ".".join(labels[1:])
+            if wildcard not in hosts:
+                hosts.append(wildcard)
     if trust_domain and hosts:
         raw = parser.get(SYNCPLAY_SECTION, "trusteddomains", fallback="[]")
         try:

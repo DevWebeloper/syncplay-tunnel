@@ -153,3 +153,29 @@ class History(JsonStore):
     def entries(self):
         with self._lock:
             return [dict(e) for e in self.data if e.get("id")]
+
+    def merge(self, incoming):
+        """Fold another machine's history into this one. Returns entries added.
+
+        Both ends may have watched something since the last sync, so neither
+        copy wins outright: entries are matched on series id and the newer
+        timestamp keeps its season and episode.
+        """
+        added = 0
+        with self._lock:
+            mine = {e.get("id"): e for e in self.data if e.get("id")}
+            for entry in incoming or []:
+                sid = entry.get("id")
+                if not sid:
+                    continue
+                current = mine.get(sid)
+                if current is None:
+                    mine[sid] = dict(entry)
+                    added += 1
+                elif float(entry.get("at") or 0) > float(current.get("at") or 0):
+                    mine[sid] = dict(entry)
+            merged = sorted(mine.values(),
+                            key=lambda e: float(e.get("at") or 0), reverse=True)
+            self.data = merged[:HISTORY_MAX]
+        self.save()
+        return added
