@@ -1103,3 +1103,41 @@ every time: three Arrow episodes found in **2.3s**, Torrentio never asked at all
 every source `direct`, and resolution finishing in **0.1s** because those links
 are already final. Also asserts the breaker returns immediately while armed and
 clears on the next success.
+
+## 20. Running the server, resuming, and one shared history
+
+### 20.1 The Syncplay server is the app's job now
+
+`server.py`. `ensure_server()` runs on every app start and before a launch: it
+does nothing unless `run_syncplay_server` is on, binds to the Tailscale address
+Tailscale reports for this machine (never 0.0.0.0, which would also listen on
+whatever other network the laptop is on), and treats "already listening" as
+success. `syncplay_server_salt` is generated once and kept, so room passwords
+survive a restart. Setup has the switch plus Start now / Stop.
+
+`--interface-ipv4` is only honoured together with `--ipv4-only`; without it the
+server also opens an IPv6 socket and listens everywhere. That is asserted.
+
+### 20.2 Resuming at the same second
+
+mpv is the only thing that knows where playback got to, so the wrapper now
+carries `--input-ipc-server`. A watcher polls `time-pos` every five seconds and
+writes it to the config — to the file rather than memory, because the case this
+exists for is the app and mpv dying together.
+
+On the next launch the wrapper gets `--start=<seconds>`, but only when the URL
+matches the one the position belongs to and only past 30s. If the other person is
+still in the room Syncplay will seek to the room's position anyway, which is
+correct; the `--start` matters when nobody is left to sync from.
+
+### 20.3 One history on both machines
+
+`History.merge()` matches on series id and lets the newer timestamp keep its
+progress, so neither copy wins outright. `Session.sync_history()` moves it: the
+client pulls the host's file, merges, and pushes the result back, which converges
+both. The client drives it because it is the end that can always reach the other
+over SSH — there is no route back. It runs after the startup scan, after a queue
+is added, and from Sync now in Setup.
+
+The far side is written through a temporary file and moved into place, so an
+interrupted copy cannot leave a half-written history.

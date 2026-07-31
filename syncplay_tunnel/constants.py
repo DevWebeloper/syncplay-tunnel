@@ -16,6 +16,7 @@ DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) /
 LOG_FILE = DATA_DIR / "session.log"
 CACHE_FILE = DATA_DIR / "cache.json"
 HISTORY_FILE = DATA_DIR / "history.json"
+MPV_SOCKET = DATA_DIR / "mpv.sock"
 
 # How long a cached answer stays good. Sources are shortest because what the
 # debrid service already holds changes, and new releases appear.
@@ -102,6 +103,15 @@ DEFAULTS = {
     # already there needs no lookup and no resolving, so it is both faster and
     # immune to the addon being down.
     "prefer_rd_cache": True,
+    # This machine runs the Syncplay server the pair meet on, started when the
+    # app opens. Only one of the two should have this on.
+    "run_syncplay_server": False,
+    "syncplay_server_salt": "",
+    # Where playback got to, so a crash can be resumed rather than restarted.
+    "last_position": 0.0,
+    "last_position_url": "",
+    # Keep the watch history the same on both machines.
+    "sync_history": True,
     # Where the last session got to, so reopening the browser lands on the next
     # episode instead of the search box. Set programmatically, no widget.
     "library_series_id": "",

@@ -504,6 +504,8 @@ only launches if it passes.
 | Torrentio options | `sort=qualitysize` | Pipe-joined, e.g. `sort=seeders\|qualityfilter=480p,scr,cam`. A `realdebrid=` here is replaced by the key above. |
 | Preferred quality | `1080p` | Matched exactly first, so it won't settle for `1080p 3D SBS` while a plain 1080p release exists. |
 | Use what is already on Real-Debrid first | on | Skips the source lookup entirely for episodes the account already has. |
+| This machine runs the server | off | Starts syncplay-server when the app opens, bound to this machine's Tailscale address. Only one of the two. |
+| Share watch history | on | Merges history both ways over the SSH link. |
 | Require a verified route | on | Leave this on. It's the whole point — it also blocks link resolution while the tunnel is down. |
 | Stop the container on drop | on | Shuts the distrobox down too when the tunnel dies. |
 | Skip Syncplay's setup dialog | on | Writes `forceguiprompt = False` to `~/.config/syncplay.ini`. Only takes effect when a URL is set. |

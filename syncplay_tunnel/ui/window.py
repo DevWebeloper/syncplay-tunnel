@@ -15,6 +15,7 @@ from ..library import Series
 from ..playlist import SyncplayPush
 from ..runtimes import (current_container, install_plan, scan_runtimes,
                         start_container, stream_command)
+from ..server import ensure_server, parse_server, stop_server
 from ..session import Session
 from ..sshkeys import (ensure_ssh_key, find_ssh_key, restrict_authorized_key,
                        restrict_local_keys, ssh_copy_id)
@@ -607,6 +608,58 @@ class Window(Adw.ApplicationWindow):
         box.append(self.where_note)
         return view
 
+    def _after_scan_chores(self):
+        """Things that need a chosen environment: the server, and the history."""
+        if self.cfg["run_syncplay_server"]:
+            self.start_server()
+        if self.cfg["sync_history"] and self.cfg["role"] != "host":
+            ok, msg = self.session.sync_history(self.history, log=self.log)
+            self.log(msg)
+            if ok:
+                GLib.idle_add(lambda: (self.refresh_history(), False)[1])
+
+    def start_server(self, _btn=None):
+        """Bring up the Syncplay server this machine is meant to be hosting."""
+        rt = self.selected_runtime()
+        me = getattr(self, "tailscale_self", None)
+        ok, msg = ensure_server(self.cfg, rt, self_ip=me.ip if me else "", log=self.log)
+        self.log(msg)
+        if ok and me:
+            _host, port = parse_server(self.cfg["syncplay_server"])
+            want = "%s:%d" % (me.ip, port)
+            if self.cfg["syncplay_server"] != want:
+                # Point ourselves at the server we just started, so the address
+                # the other side is given is the one actually listening.
+                self.cfg["syncplay_server"] = want
+                GLib.idle_add(lambda: (self.e_syncplay_server.set_text(want), False)[1])
+        GLib.idle_add(lambda: (self.toast(msg), False)[1])
+        return ok
+
+    def on_start_server(self, btn):
+        threading.Thread(target=self.start_server, daemon=True).start()
+
+    def on_stop_server(self, _btn):
+        rt = self.selected_runtime()
+        threading.Thread(target=lambda: stop_server(rt, log=self.log), daemon=True).start()
+        self.toast("Stopping the Syncplay server")
+
+    def push_history(self):
+        """Send a change out to the other machine, quietly."""
+        if not self.cfg["sync_history"] or self.cfg["role"] == "host":
+            return
+        def work():
+            ok, msg = self.session.sync_history(self.history, log=self.log)
+            if not ok:
+                self.log(msg)
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_sync_history(self, _btn):
+        def work():
+            ok, msg = self.session.sync_history(self.history, log=self.log)
+            self.log(msg)
+            GLib.idle_add(lambda: (self.refresh_history(), self.toast(msg), False)[2])
+        threading.Thread(target=work, daemon=True).start()
+
     def _set_env_rows(self, found, placeholder="Scanning…", select=None):
         """Refill the environment list. `select` is an index into `found`."""
         child = self.env_list.get_first_child()
@@ -796,6 +849,8 @@ class Window(Adw.ApplicationWindow):
 
             self._set_env_rows(found, "Nothing found to launch from", index or 0)
             self.on_env_selected()
+            if autostart:
+                threading.Thread(target=self._after_scan_chores, daemon=True).start()
 
             complete = [r for r in found if r.complete]
             if not found:
@@ -920,6 +975,29 @@ class Window(Adw.ApplicationWindow):
                    "The port sshd listens on at the other end.")
         page.add(conn)
 
+        srv = Adw.PreferencesGroup(
+            title="Syncplay server",
+            description="You both need a server to meet on. Run it on one of the two "
+                        "machines — whichever is more often awake — and point the "
+                        "other at that address. Only one of you should turn this on.")
+        self._switch(srv, "This machine runs the server", "run_syncplay_server",
+                     "Started when the app opens, bound to this machine's Tailscale "
+                     "address only, so it is not exposed on whatever other network "
+                     "you are on.")
+        srv_row = Adw.ActionRow(title="Server process")
+        start_btn = Gtk.Button(label="Start now")
+        start_btn.set_valign(Gtk.Align.CENTER)
+        start_btn.connect("clicked", self.on_start_server)
+        srv_row.add_suffix(start_btn)
+        stop_btn = Gtk.Button(label="Stop")
+        stop_btn.set_valign(Gtk.Align.CENTER)
+        stop_btn.add_css_class("destructive-action")
+        stop_btn.connect("clicked", self.on_stop_server)
+        srv_row.add_suffix(stop_btn)
+        srv_row.set_subtitle("Needs syncplay-server in the environment under Where")
+        srv.add(srv_row)
+        page.add(srv)
+
         sync = Adw.PreferencesGroup(
             title="Syncplay",
             description="Leave blank to use Syncplay's own saved settings. The server "
@@ -983,7 +1061,16 @@ class Window(Adw.ApplicationWindow):
         self.cache_row.add_suffix(clear_cache)
         upkeep.add(self.cache_row)
 
+        self._switch(upkeep, "Share watch history with the other machine",
+                     "sync_history",
+                     "Merged both ways over the SSH link, so whatever either of you "
+                     "watched shows up on both. The newer entry keeps its progress.")
+
         self.history_row = Adw.ActionRow(title="Watch history")
+        sync_btn = Gtk.Button(label="Sync now")
+        sync_btn.set_valign(Gtk.Align.CENTER)
+        sync_btn.connect("clicked", self.on_sync_history)
+        self.history_row.add_suffix(sync_btn)
         clear_hist = Gtk.Button(label="Clear")
         clear_hist.set_valign(Gtk.Align.CENTER)
         clear_hist.add_css_class("destructive-action")
@@ -1529,6 +1616,8 @@ class Window(Adw.ApplicationWindow):
                 self.log(msg)
                 GLib.idle_add(self.on_state, "idle")
                 return
+        if self.cfg["run_syncplay_server"]:
+            self.start_server()
         if not s.write_mpv_wrapper(rt, proxied=not host_mode):
             GLib.idle_add(self.on_state, "idle")
             return
@@ -1536,6 +1625,7 @@ class Window(Adw.ApplicationWindow):
         if not host_mode:
             s.start_watchdog()
         s.launch_player(rt, proxied=not host_mode)
+        s.start_position_watch()
         GLib.idle_add(self.on_state, "playing-host" if host_mode else "playing")
         if not host_mode:
             notify(APP_NAME, "Connected. Syncplay is starting.")

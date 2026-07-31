@@ -221,6 +221,15 @@ def probe_container(rt, mgr, allow_start=False, log=None):
     return rt
 
 
+def wrap_in_runtime(rt, inner):
+    """argv that runs a bash snippet inside the chosen environment."""
+    if rt is None or rt.kind == "native":
+        return host_prefix() + ["bash", "-lc", inner]
+    if in_container() and os.environ.get("CONTAINER_ID") == rt.name:
+        return ["bash", "-lc", inner]          # already inside the target
+    return host_prefix() + ["distrobox", "enter", rt.name, "--", "bash", "-lc", inner]
+
+
 def start_container(name, log=None):
     """Bring one container up. Returns True when it is running afterwards.
 

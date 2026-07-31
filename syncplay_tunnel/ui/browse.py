@@ -564,6 +564,7 @@ class BrowseWindow(Adw.Window):
             self.main.history.remember(self.chosen_series.id, self.chosen_series.name,
                                        self.chosen_series.year, last.season, last.number)
             self.main.refresh_history()
+            self.main.push_history()
             self.cfg["library_series_id"] = self.chosen_series.id
             self.cfg["library_series_name"] = self.chosen_series.name
             self.cfg["library_season"] = last.season

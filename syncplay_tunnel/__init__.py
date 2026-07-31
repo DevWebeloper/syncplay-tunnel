@@ -24,6 +24,8 @@ from .runtimes import (Runtime, container_manager, current_container,
                        host_has, host_prefix, host_run, install_plan,
                        list_distroboxes, probe_container, probe_native,
                        scan_runtimes, start_container, stream_command)
+from .server import (ensure_server, make_salt, parse_server,
+                     server_command, server_running, stop_server)
 from .session import Session
 from .sshkeys import (ensure_ssh_key, find_ssh_key, key_line_is_open,
                       restrict_authorized_key, restrict_local_keys, ssh_copy_id)
